@@ -585,18 +585,12 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
 
     fn sweep_large_pages(&mut self, sweep_nursery: bool) {
         let sweep = |object: ObjectReference| {
-            // Clear log bits for dead objects to prevent a new nursery object having the unlog bit set.
-            // The whole range is cleared, not only the object's own bit: a binding may keep a bit for each
-            // reference slot of an array, as Celerity's does.
+            // Clear log bits for dead objects to prevent a new nursery object having the unlog bit set
+            // TODO: This code path assumes the log bit is object log bit instead of field log bit.
+            // When generational plans and ConcurrentImmix support field log bit,
+            // we can push this clean-up operation into `Self::release_object`.
             if self.clear_log_bit_on_sweep {
-                if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC {
-                    side.bzero_metadata(
-                        object.to_object_start::<VM>(),
-                        VM::VMObjectModel::get_current_size(object),
-                    );
-                } else {
-                    VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
-                }
+                VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
             }
             self.release_object(object);
         };
