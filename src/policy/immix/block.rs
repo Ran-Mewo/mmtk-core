@@ -397,6 +397,25 @@ impl Block {
         true
     }
 
+    /// Count the lines marked in `line_mark_state` and the holes between them, as `sweep` counts them.
+    pub fn count_marked_lines_and_holes(&self, line_mark_state: u8) -> (usize, usize) {
+        let mut marked_lines = 0;
+        let mut holes = 0;
+        let mut prev_line_is_marked = true;
+        for line in self.lines() {
+            if line.is_marked(line_mark_state) {
+                marked_lines += 1;
+                prev_line_is_marked = true;
+            } else {
+                if prev_line_is_marked {
+                    holes += 1;
+                }
+                prev_line_is_marked = false;
+            }
+        }
+        (marked_lines, holes)
+    }
+
     /// Sweep this block.
     pub fn sweep<VM: VMBinding>(
         &self,

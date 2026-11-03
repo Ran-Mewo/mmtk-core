@@ -72,6 +72,13 @@ pub struct ImmixSpace<VM: VMBinding> {
     line_unavail_state: AtomicU8,
     /// A list of all reusable blocks
     pub reusable_blocks: ReusableBlockPool,
+    /// Blocks handed to an allocator since the last GC. A nursery GC of a mixed-age space sweeps
+    /// only these: no other block holds young objects, so their line marks and states are the
+    /// same as when they were last swept.
+    blocks_allocated_since_gc: std::sync::Mutex<Vec<Block>>,
+    /// Whether nursery GCs have swept only some blocks since the last full sweep, so that
+    /// `defrag.mark_histograms` no longer covers every block.
+    mark_histograms_stale: bool,
     /// Defrag utilities
     pub(super) defrag: Defrag,
     /// How many lines have been consumed since last GC?
@@ -483,6 +490,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             lines_consumed: AtomicUsize::new(0),
             reused_lines_consumed: AtomicUsize::new(0),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
+            blocks_allocated_since_gc: std::sync::Mutex::new(Vec::new()),
+            mark_histograms_stale: false,
             defrag: Defrag::default(),
             // Set to the correct mark state when inititialized. We cannot rely on prepare to set it (prepare may get skipped in nursery GCs).
             mark_state: Self::MARKED_STATE,
@@ -610,6 +619,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
             // Prepare defrag info
             if self.is_defrag_enabled() {
+                if !super::BLOCK_ONLY && self.mark_histograms_stale && self.in_defrag() {
+                    self.recount_mark_histograms();
+                }
                 self.defrag.prepare(self, plan_stats.unwrap());
             }
 
@@ -689,15 +701,84 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 );
             }
         }
-        // Clear reusable blocks list
-        if !super::BLOCK_ONLY {
-            self.reusable_blocks.reset();
+        let sweep_allocated_blocks_only =
+            !major_gc && self.sweeps_allocated_blocks_only_in_nursery_gc();
+        if sweep_allocated_blocks_only {
+            // Blocks that are not swept keep their place in the reusable blocks list.
+            debug_assert!(unlog_bits_op == UnlogBitsOperation::NoOp);
+            let work_packets = self.generate_allocated_block_sweep_tasks();
+            self.scheduler().work_buckets[WorkBucketStage::Release].bulk_add(work_packets);
+            self.mark_histograms_stale = true;
+        } else {
+            // Clear reusable blocks list
+            if !super::BLOCK_ONLY {
+                self.reusable_blocks.reset();
+            }
+            // Sweep chunks and blocks
+            let work_packets = self.generate_sweep_tasks(unlog_bits_op);
+            self.scheduler().work_buckets[WorkBucketStage::Release].bulk_add(work_packets);
+            self.blocks_allocated_since_gc.lock().unwrap().clear();
+            self.mark_histograms_stale = false;
         }
-        // Sweep chunks and blocks
-        let work_packets = self.generate_sweep_tasks(unlog_bits_op);
-        self.scheduler().work_buckets[WorkBucketStage::Release].bulk_add(work_packets);
 
         self.lines_consumed.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether nursery GCs sweep only the blocks allocated since the last GC.
+    fn sweeps_allocated_blocks_only_in_nursery_gc(&self) -> bool {
+        self.space_args.mixed_age && !self.rc_enabled
+    }
+
+    fn record_allocated_block(&self, block: Block) {
+        if self.sweeps_allocated_blocks_only_in_nursery_gc() {
+            self.blocks_allocated_since_gc.lock().unwrap().push(block);
+        }
+    }
+
+    /// Generate sweep tasks for the blocks allocated since the last GC.
+    fn generate_allocated_block_sweep_tasks(&self) -> Vec<Box<dyn GCWork<VM>>> {
+        const BLOCKS_PER_PACKET: usize = 32;
+        let blocks = std::mem::take(&mut *self.blocks_allocated_since_gc.lock().unwrap());
+        // # Safety: ImmixSpace reference is always valid within this collection cycle.
+        let space = unsafe { &*(self as *const Self) };
+        let epilogue = Arc::new(FlushPageResource {
+            space,
+            counter: AtomicUsize::new(0),
+        });
+        let tasks: Vec<Box<dyn GCWork<VM>>> = blocks
+            .chunks(BLOCKS_PER_PACKET)
+            .map(|blocks| {
+                Box::new(SweepBlocks {
+                    space,
+                    blocks: blocks.to_vec(),
+                    epilogue: epilogue.clone(),
+                }) as Box<dyn GCWork<VM>>
+            })
+            .collect();
+        epilogue.counter.store(tasks.len(), Ordering::SeqCst);
+        tasks
+    }
+
+    /// Count `defrag.mark_histograms` again from the line marks of every block. Line marks only
+    /// change during GCs, so this gives the histograms a sweep of every block at the end of the
+    /// last GC would have given.
+    fn recount_mark_histograms(&self) {
+        let line_mark_state = self.line_mark_state.load(Ordering::Acquire);
+        let mut histogram = self.defrag.new_histogram();
+        for chunk in self.chunk_map.all_chunks() {
+            for block in chunk
+                .iter_region::<Block>()
+                .filter(|block| block.get_state() != BlockState::Unallocated)
+            {
+                let (marked_lines, holes) = block.count_marked_lines_and_holes(line_mark_state);
+                if marked_lines != 0 {
+                    histogram[holes] += marked_lines;
+                }
+            }
+        }
+        let mut histograms = self.defrag.mark_histograms.lock();
+        histograms.clear();
+        histograms.push(histogram);
     }
 
     /// This is called when a GC finished.
@@ -760,6 +841,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         }
         block.init(copy, false, self);
         self.chunk_map.set_allocated(block.chunk(), true);
+        self.record_allocated_block(block);
         if !self.rc_enabled {
             self.lines_consumed
                 .fetch_add(Block::LINES, Ordering::SeqCst);
@@ -807,6 +889,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
 
             block.init(copy, true, self);
+            self.record_allocated_block(block);
             return Some(block);
         }
     }
@@ -1448,6 +1531,38 @@ impl<VM: VMBinding> GCWork<VM> for PrepareBlockState<VM> {
 
         self.unlog_bits_op
             .execute::<VM>(self.chunk.start(), Chunk::BYTES);
+    }
+}
+
+/// Sweeps blocks allocated since the last GC, in a nursery GC of a mixed-age space. It does not
+/// update `defrag.mark_histograms`, which only a defrag GC reads and which it counts again, or
+/// release empty chunks, which the next full sweep does.
+struct SweepBlocks<VM: VMBinding> {
+    space: &'static ImmixSpace<VM>,
+    blocks: Vec<Block>,
+    /// A destructor invoked when all `SweepBlocks` packets are finished.
+    epilogue: Arc<FlushPageResource<VM>>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for SweepBlocks<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let mut histogram = self.space.defrag.new_histogram();
+        let line_mark_state = if super::BLOCK_ONLY {
+            None
+        } else {
+            Some(self.space.line_mark_state.load(Ordering::Acquire))
+        };
+        let is_moving_gc = mmtk.get_plan().current_gc_may_move_object();
+        for &block in &self.blocks {
+            // Only these blocks hold young objects, so only they can hold forwarded ones.
+            if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC {
+                if is_moving_gc {
+                    side.bzero_metadata(block.start(), Block::BYTES);
+                }
+            }
+            block.sweep(self.space, &mut histogram, line_mark_state);
+        }
+        self.epilogue.finish_one_work_packet();
     }
 }
 
