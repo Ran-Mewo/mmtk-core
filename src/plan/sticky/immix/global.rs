@@ -20,7 +20,7 @@ use crate::util::copy::CopySelector;
 use crate::util::copy::CopySemantics;
 use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
-use crate::util::metadata::side_metadata::spec_defs::CONC_MARK;
+use crate::util::metadata::side_metadata::spec_defs::{CONC_COVERED, CONC_MARK};
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::statistics::counter::EventCounter;
 use crate::util::ObjectReference;
@@ -452,6 +452,7 @@ impl<VM: VMBinding> StickyImmix<VM> {
         let mut global_specs = crate::plan::generational::new_generational_global_metadata_specs::<VM>();
         if concurrent_marking {
             global_specs.push(CONC_MARK);
+            global_specs.push(CONC_COVERED);
         }
         let plan_args = CreateSpecificPlanArgs {
             global_args: args,
@@ -540,6 +541,9 @@ impl<VM: VMBinding> StickyImmix<VM> {
         self.concurrent_marking.store(false, Ordering::SeqCst);
         self.immix.immix_space.end_concurrent_marking(replaced_by_full_heap_collection);
         self.immix.common.los.end_concurrent_marking();
+        // The spaces clear their objects' covered bits as they sweep; the VM space is never swept.
+        #[cfg(feature = "vm_space")]
+        self.immix.common.base.vm_space.bzero_side_metadata(&CONC_COVERED);
     }
 
     /// Whether a concurrent full-heap mark is running, between its initial-mark and final-mark pauses.

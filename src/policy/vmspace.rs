@@ -227,6 +227,13 @@ impl<VM: VMBinding> VMSpace<VM> {
         self.set_vm_region_inner(start, size, false);
     }
 
+    /// Zero `spec` over every region the space holds.
+    pub(crate) fn bzero_side_metadata(&self, spec: &crate::util::metadata::side_metadata::SideMetadataSpec) {
+        for pages in self.pr.get_external_pages().iter() {
+            spec.bzero_metadata(pages.start, pages.end - pages.start);
+        }
+    }
+
     fn set_vm_region_inner(&self, start: Address, size: usize, init: bool) {
         assert!(size > 0);
         assert!(!start.is_zero());

@@ -11,6 +11,8 @@ pub(crate) mod ranges;
 mod sanity;
 mod side_metadata_tests;
 pub(crate) mod spec_defs;
+/// StickyImmix's table of objects recorded for the running concurrent mark, which a VM's inlined write barrier may read to skip the slow path.
+pub use spec_defs::CONC_COVERED;
 
 pub use global::*;
 pub use layout::*;

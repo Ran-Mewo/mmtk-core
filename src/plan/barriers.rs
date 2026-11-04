@@ -64,6 +64,9 @@ pub trait Barrier<VM: VMBinding>: 'static + Send + Downcast {
     /// *   `referent`: The referent object which the weak reference is pointing to.
     fn load_weak_reference(&mut self, _referent: ObjectReference) {}
 
+    /// A write that needs nothing from the barrier but what a concurrent mark needs: the VM found `src` unlogged while a mark runs and is storing a value no other collection needs to know about, so the object is recorded for the mark and stays unlogged.
+    fn record_for_concurrent_mark(&mut self, _src: ObjectReference) {}
+
     /// Subsuming barrier for object reference write
     fn object_reference_write(
         &mut self,
@@ -278,6 +281,10 @@ impl<S: BarrierSemantics> Barrier<S::VM> for ObjectBarrier<S> {
 
     fn load_weak_reference(&mut self, o: ObjectReference) {
         self.semantics.load_weak_reference(o)
+    }
+
+    fn record_for_concurrent_mark(&mut self, src: ObjectReference) {
+        self.semantics.before_logging(src);
     }
 }
 

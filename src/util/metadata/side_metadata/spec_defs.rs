@@ -65,6 +65,8 @@ define_side_metadata_specs!(
     CHUNK_MARK   = (global: true, log_num_of_bits: 3, log_bytes_in_region: crate::util::heap::chunk_map::Chunk::LOG_BYTES),
     // Old objects reached by StickyImmix's concurrent full-heap mark, apart from the mark bits that tell old from young
     CONC_MARK    = (global: true, log_num_of_bits: 0, log_bytes_in_region: LOG_MIN_OBJECT_SIZE as usize),
+    // Objects whose references the write barrier has recorded for the running concurrent mark, which then needs nothing more from their writes
+    CONC_COVERED = (global: true, log_num_of_bits: 0, log_bytes_in_region: LOG_MIN_OBJECT_SIZE as usize),
 );
 
 // This defines all LOCAL side metadata used by mmtk-core.

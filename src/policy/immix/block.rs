@@ -5,7 +5,7 @@ use crate::util::constants::*;
 use crate::util::heap::blockpageresource::BlockPool;
 use crate::util::heap::chunk_map::Chunk;
 use crate::util::linear_scan::{Region, RegionIterator, UnstraddlableRegion};
-use crate::util::metadata::side_metadata::spec_defs::CONC_MARK;
+use crate::util::metadata::side_metadata::spec_defs::{CONC_COVERED, CONC_MARK};
 use crate::util::metadata::side_metadata::*;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
@@ -513,6 +513,7 @@ impl Block {
                     Self::clear_dead_object_bits::<VM>(start, self.end());
                 }
                 CONC_MARK.bzero_metadata(self.start(), Block::BYTES);
+                CONC_COVERED.bzero_metadata(self.start(), Block::BYTES);
             }
 
             if marked_lines == 0 {

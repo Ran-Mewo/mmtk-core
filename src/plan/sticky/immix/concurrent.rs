@@ -1,6 +1,7 @@
 //! Concurrent full-heap marking for StickyImmix. An initial-mark pause, which is also a nursery collection, takes the snapshot: every object live at its end is old. Collector threads then mark old objects while mutators run and nursery collections go on, the write barrier records what an old object holds before its first change, and a final-mark pause, again a nursery collection, finishes the mark and sweeps the old space. Old objects never move while the mark runs, and young ones are never traced: they were allocated after the snapshot, so they are live until a nursery collection decides otherwise.
 
 use std::marker::PhantomData;
+use std::sync::atomic::Ordering;
 
 use crate::global_state::GcStatus;
 use crate::plan::barriers::BarrierSemantics;
@@ -12,6 +13,7 @@ use crate::plan::{ConcurrentPlan, VectorQueue};
 use crate::policy::gc_work::{DEFAULT_TRACE, TRACE_KIND_TRANSITIVE_PIN};
 use crate::scheduler::gc_work::RootKind;
 use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
+use crate::util::metadata::side_metadata::spec_defs::CONC_COVERED;
 use crate::util::{ObjectReference, VMMutatorThread};
 use crate::vm::slot::Slot;
 use crate::vm::{RootsWorkFactory, Scanning, VMBinding};
@@ -92,13 +94,15 @@ impl<VM: VMBinding> BarrierSemantics for StickyImmixBarrierSemantics<VM> {
         self.generational.object_probable_write_slow(obj);
     }
 
+    // An object's references need recording once per mark: whatever is stored in it later was either recorded with it or came from elsewhere after the snapshot. The bit is set only once the record is complete, so a writer that finds it set loses nothing.
     fn before_logging(&mut self, src: ObjectReference) {
-        if self.plan.is_concurrent_marking() {
+        if self.plan.is_concurrent_marking() && CONC_COVERED.load_atomic::<u8>(src.to_raw_address(), Ordering::Acquire) == 0 {
             src.iterate_fields::<VM, _>(self.tls.0, |slot| {
                 if let Some(target) = slot.load() {
                     self.record(target);
                 }
             });
+            CONC_COVERED.fetch_or_atomic::<u8>(src.to_raw_address(), 1, Ordering::Release);
         }
     }
 

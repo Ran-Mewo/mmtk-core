@@ -17,7 +17,7 @@ use crate::util::heap::BlockPageResource;
 use crate::util::heap::PageResource;
 use crate::util::linear_scan::{Region, RegionIterator, UnstraddlableRegion};
 use crate::util::metadata::log_bit::UnlogBitsOperation;
-use crate::util::metadata::side_metadata::spec_defs::{CONC_MARK, IX_LINE_REUSE_COUNT};
+use crate::util::metadata::side_metadata::spec_defs::{CONC_COVERED, CONC_MARK, IX_LINE_REUSE_COUNT};
 use crate::util::metadata::side_metadata::*;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
@@ -1605,6 +1605,7 @@ impl<VM: VMBinding> PrepareBlockState<VM> {
         // A full collection may replace a concurrent mark that had not finished.
         if self.space.uses_concurrent_marking {
             CONC_MARK.bzero_metadata(self.chunk.start(), Chunk::BYTES);
+            CONC_COVERED.bzero_metadata(self.chunk.start(), Chunk::BYTES);
         }
     }
 }

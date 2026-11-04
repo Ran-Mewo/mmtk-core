@@ -8,7 +8,7 @@ use crate::util::alloc::allocator::AllocationOptions;
 use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::heap::{FreeListPageResource, PageResource};
 use crate::util::metadata;
-use crate::util::metadata::side_metadata::spec_defs::{CONC_MARK, LOS_PAGE_REUSE_COUNT};
+use crate::util::metadata::side_metadata::spec_defs::{CONC_COVERED, CONC_MARK, LOS_PAGE_REUSE_COUNT};
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::ClosureObjectEnumerator;
 use crate::util::object_enum::ObjectEnumerator;
@@ -515,6 +515,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         debug_assert!(self.concurrent_marking.load(Ordering::Relaxed));
         let mut dead = vec![];
         self.treadmill.retain_mature(|&object| {
+            CONC_COVERED.store_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed);
             let live = CONC_MARK.fetch_and_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed) != 0;
             if !live {
                 dead.push(object);
@@ -564,7 +565,10 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             self.mark_state = MARK_BIT - self.mark_state;
             // A full collection may replace a concurrent mark that had not finished.
             if self.uses_concurrent_marking {
-                let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|object| CONC_MARK.store_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed));
+                let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|object| {
+                    CONC_MARK.store_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed);
+                    CONC_COVERED.store_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed);
+                });
                 self.treadmill.enumerate_objects(&mut enumerator, true);
             }
         }
