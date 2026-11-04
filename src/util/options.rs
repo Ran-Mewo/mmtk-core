@@ -1011,6 +1011,10 @@ options! {
     immix_defrag_headroom_percent: usize            [|v: &usize| *v <= 50] = 5,
     /// Disable concurrent marking in ConcurrentImmix. Setting this to true will make ConcurrentImmix behave exactly like full heap Immix. This option is only intended for debugging.
     concurrent_immix_disable_concurrent_marking: bool              [always_valid] = false,
+    /// Collect StickyImmix's old space with a concurrent mark between nursery collections instead of in one full-heap pause. Full-heap pauses still happen when an allocation fails, or for a user-requested collection with `full_heap_system_gc`.
+    sticky_immix_concurrent_marking: bool          [always_valid] = false,
+    /// StickyImmix starts a concurrent mark at the first nursery collection after the heap is more than this percentage full.
+    sticky_immix_concurrent_mark_trigger: usize    [|v: &usize| *v <= 100] = 50,
     /// Trigger an LXR pause once this many reference-count increments are pending, bounding the
     /// `RCProcessIncs` work a single pause has to do. Each pending increment is one slot the write
     /// barrier recorded, so the limit is roughly "words of reference stores between pauses".

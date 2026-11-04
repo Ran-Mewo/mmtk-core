@@ -179,6 +179,9 @@ pub trait BarrierSemantics: 'static + Send {
     /// Object will probably be modified
     fn object_probable_write_slow(&mut self, _obj: ObjectReference) {}
 
+    /// Called by [`ObjectBarrier`] for an unlogged object before it tries to log it, so anything the object holds is still unchanged. Another thread that finds the object logged goes ahead with its write, so whatever this records must be recorded here and not after logging.
+    fn before_logging(&mut self, _src: ObjectReference) {}
+
     /// Loading from a weak reference field
     fn load_weak_reference(&mut self, _o: ObjectReference) {}
 }
@@ -252,6 +255,7 @@ impl<S: BarrierSemantics> Barrier<S::VM> for ObjectBarrier<S> {
         slot: <S::VM as VMBinding>::VMSlot,
         target: Option<ObjectReference>,
     ) {
+        self.semantics.before_logging(src);
         if self.log_object(src) {
             self.semantics
                 .object_reference_write_slow(src, slot, target);
@@ -270,6 +274,10 @@ impl<S: BarrierSemantics> Barrier<S::VM> for ObjectBarrier<S> {
         if self.object_is_unlogged(obj) {
             self.semantics.object_probable_write_slow(obj);
         }
+    }
+
+    fn load_weak_reference(&mut self, o: ObjectReference) {
+        self.semantics.load_weak_reference(o)
     }
 }
 

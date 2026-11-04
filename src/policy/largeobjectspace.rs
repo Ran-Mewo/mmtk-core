@@ -8,7 +8,7 @@ use crate::util::alloc::allocator::AllocationOptions;
 use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::heap::{FreeListPageResource, PageResource};
 use crate::util::metadata;
-use crate::util::metadata::side_metadata::spec_defs::LOS_PAGE_REUSE_COUNT;
+use crate::util::metadata::side_metadata::spec_defs::{CONC_MARK, LOS_PAGE_REUSE_COUNT};
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::ClosureObjectEnumerator;
 use crate::util::object_enum::ObjectEnumerator;
@@ -134,6 +134,12 @@ pub struct LargeObjectSpace<VM: VMBinding> {
     /// needed while concurrent marking can be validating a remembered set; set/cleared by the
     /// owning plan (currently only LXR) as concurrent marking starts/ends.
     pub(crate) bump_page_reuse_count: AtomicBool,
+    /// Whether the plan marks the old space concurrently, which maps the `CONC_MARK` table.
+    uses_concurrent_marking: bool,
+    /// Whether a concurrent full-heap mark is running, from the end of its initial pause to the end of its final one. An object promoted meanwhile is live for it.
+    concurrent_marking: AtomicBool,
+    /// Whether the final-mark pause is deciding liveness, when a mature object is live only if the concurrent mark reached it.
+    final_mark: AtomicBool,
 }
 
 impl<VM: VMBinding> SFT for LargeObjectSpace<VM> {
@@ -147,7 +153,7 @@ impl<VM: VMBinding> SFT for LargeObjectSpace<VM> {
             }
             return self.rc.count(object) > 0;
         }
-        self.is_marked(object)
+        self.is_marked(object) && (!self.final_mark.load(Ordering::Relaxed) || self.is_concurrent_marked(object))
     }
     fn is_reachable(&self, object: ObjectReference) -> bool {
         if self.rc_enabled {
@@ -470,6 +476,56 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             rc: RefCountHelper::NEW,
             is_end_of_satb_or_full_gc: false,
             bump_page_reuse_count: AtomicBool::new(false),
+            uses_concurrent_marking: false,
+            concurrent_marking: AtomicBool::new(false),
+            final_mark: AtomicBool::new(false),
+        }
+    }
+
+    /// Let the space take part in concurrent full-heap marking. Called once by the plan, which maps `CONC_MARK`.
+    pub(crate) fn use_concurrent_marking(&mut self) {
+        self.uses_concurrent_marking = true;
+    }
+
+    pub(crate) fn start_concurrent_marking(&self) {
+        debug_assert!(self.uses_concurrent_marking);
+        self.concurrent_marking.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn start_final_mark(&self) {
+        self.final_mark.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn end_concurrent_marking(&self) {
+        self.concurrent_marking.store(false, Ordering::SeqCst);
+        self.final_mark.store(false, Ordering::SeqCst);
+    }
+
+    /// Mark a mature object for the concurrent full-heap mark. Returns whether this call marked it; a nursery object is never marked, since it was allocated after the mark's snapshot.
+    pub fn attempt_concurrent_mark(&self, object: ObjectReference) -> bool {
+        self.is_marked(object) && CONC_MARK.fetch_or_atomic::<u8>(object.to_raw_address(), 1, Ordering::SeqCst) == 0
+    }
+
+    pub fn is_concurrent_marked(&self, object: ObjectReference) -> bool {
+        CONC_MARK.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0
+    }
+
+    /// The final sweep of a concurrent full-heap mark: release the mature objects it did not reach, and clear the mark of those it did.
+    pub(crate) fn release_after_concurrent_marking(&mut self) {
+        debug_assert!(self.concurrent_marking.load(Ordering::Relaxed));
+        let mut dead = vec![];
+        self.treadmill.retain_mature(|&object| {
+            let live = CONC_MARK.fetch_and_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed) != 0;
+            if !live {
+                dead.push(object);
+            }
+            live
+        });
+        for object in dead {
+            if self.clear_log_bit_on_sweep {
+                VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
+            }
+            self.release_object(object);
         }
     }
 
@@ -506,6 +562,11 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     pub fn prepare(&mut self, full_heap: bool) {
         if full_heap {
             self.mark_state = MARK_BIT - self.mark_state;
+            // A full collection may replace a concurrent mark that had not finished.
+            if self.uses_concurrent_marking {
+                let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|object| CONC_MARK.store_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed));
+                self.treadmill.enumerate_objects(&mut enumerator, true);
+            }
         }
         self.num_pages_released_lazy.store(0, Ordering::Relaxed);
         if self.rc_enabled {
@@ -568,6 +629,10 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             );
             // If the object was a nursery object, we move it to `to_space` in the treadmill.
             self.treadmill.copy(object, was_nursery_object);
+            // A nursery collection promotes it while a concurrent mark runs: it is live for the mark, which never traces it.
+            if was_nursery_object && self.concurrent_marking.load(Ordering::Relaxed) {
+                CONC_MARK.store_atomic::<u8>(object.to_raw_address(), 1, Ordering::Relaxed);
+            }
             // We just moved the object out of the logical nursery, mark it as unlogged.
             // We also unlog mature objects as their unlog bit may have been unset before the
             // full-heap GC

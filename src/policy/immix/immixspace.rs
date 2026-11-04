@@ -17,7 +17,7 @@ use crate::util::heap::BlockPageResource;
 use crate::util::heap::PageResource;
 use crate::util::linear_scan::{Region, RegionIterator, UnstraddlableRegion};
 use crate::util::metadata::log_bit::UnlogBitsOperation;
-use crate::util::metadata::side_metadata::spec_defs::IX_LINE_REUSE_COUNT;
+use crate::util::metadata::side_metadata::spec_defs::{CONC_MARK, IX_LINE_REUSE_COUNT};
 use crate::util::metadata::side_metadata::*;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
@@ -35,7 +35,7 @@ use crate::{
     MMTK,
 };
 use atomic::Ordering;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::OnceLock;
 use std::sync::{atomic::AtomicU8, Arc};
 
@@ -94,6 +94,14 @@ pub struct ImmixSpace<VM: VMBinding> {
     pub rc_enabled: bool,
     pub is_end_of_satb_or_full_gc: bool,
     pub rc: RefCountHelper<VM>,
+    /// Whether the plan marks the old space concurrently, which maps the `CONC_MARK` table.
+    uses_concurrent_marking: bool,
+    /// Whether a concurrent full-heap mark is running, from the end of its initial pause to the end of its final one. An object promoted meanwhile is live for it.
+    concurrent_marking: AtomicBool,
+    /// Whether the final-mark pause is deciding liveness, when an old object is live only if the concurrent mark reached it.
+    final_mark: AtomicBool,
+    /// Whether the coming full-heap collection replaces an unfinished concurrent mark, whose live lines then carry either of two epochs.
+    concurrent_mark_replaced: AtomicBool,
 }
 
 /// Some arguments for Immix Space.
@@ -160,7 +168,7 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
         }
         // If the mark bit is set, it is live.
         if self.is_marked(object) {
-            return true;
+            return !self.final_mark.load(Ordering::Relaxed) || self.is_concurrent_marked(object);
         }
 
         // If we never move objects, look no further.
@@ -501,6 +509,10 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             rc_enabled,
             is_end_of_satb_or_full_gc: false,
             rc: RefCountHelper::NEW,
+            uses_concurrent_marking: false,
+            concurrent_marking: AtomicBool::new(false),
+            final_mark: AtomicBool::new(false),
+            concurrent_mark_replaced: AtomicBool::new(false),
         }
     }
 
@@ -627,6 +639,15 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
             // Prepare each block for GC
             let threshold = self.defrag.defrag_spill_threshold.load(Ordering::Acquire);
+            // A full collection that replaces an unfinished concurrent mark finds live lines with either the mark's epoch or the one before. The hole search can keep only one epoch unavailable besides the current one, so lines of the older epoch take the mark's.
+            let relabel_lines = if !super::BLOCK_ONLY && self.concurrent_mark_replaced.swap(false, Ordering::SeqCst) {
+                let older = self.line_unavail_state.load(Ordering::Acquire);
+                let marking = self.line_mark_state.load(Ordering::Acquire);
+                self.line_unavail_state.store(marking, Ordering::Release);
+                Some((older, marking))
+            } else {
+                None
+            };
             // # Safety: ImmixSpace reference is always valid within this collection cycle.
             let space = unsafe { &*(self as *const Self) };
             let work_packets = self.chunk_map.generate_tasks(|chunk| {
@@ -639,6 +660,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                         None
                     },
                     unlog_bits_op,
+                    relabel_lines,
                 })
             });
             self.scheduler().work_buckets[WorkBucketStage::Prepare].bulk_add(work_packets);
@@ -715,13 +737,76 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 self.reusable_blocks.reset();
             }
             // Sweep chunks and blocks
-            let work_packets = self.generate_sweep_tasks(unlog_bits_op);
+            let work_packets = self.generate_sweep_tasks(unlog_bits_op, false);
             self.scheduler().work_buckets[WorkBucketStage::Release].bulk_add(work_packets);
             self.blocks_allocated_since_gc.lock().unwrap().clear();
             self.mark_histograms_stale = false;
         }
 
         self.lines_consumed.store(0, Ordering::Relaxed);
+    }
+
+    /// Release at the end of a concurrent full-heap mark: sweep every block, keeping only lines the mark reached or that hold objects promoted while it ran. Nothing cleared the mark and log bits of the old space before the mark, as a full collection's prepare does, so the sweep clears them for every line it frees.
+    pub(crate) fn release_after_concurrent_marking(&mut self) {
+        debug_assert!(self.concurrent_marking.load(Ordering::Relaxed));
+        self.line_unavail_state.store(self.line_mark_state.load(Ordering::Acquire), Ordering::Release);
+        self.reusable_blocks.reset();
+        let work_packets = self.generate_sweep_tasks(UnlogBitsOperation::NoOp, true);
+        self.scheduler().work_buckets[WorkBucketStage::Release].bulk_add(work_packets);
+        self.blocks_allocated_since_gc.lock().unwrap().clear();
+        self.mark_histograms_stale = false;
+        self.lines_consumed.store(0, Ordering::Relaxed);
+    }
+
+    /// Let the space take part in concurrent full-heap marking. Called once by the plan, which maps `CONC_MARK`.
+    pub(crate) fn use_concurrent_marking(&mut self) {
+        self.uses_concurrent_marking = true;
+    }
+
+    /// Start a concurrent full-heap mark at the end of its initial pause. Lines the marker and promotions mark from now on carry a new epoch, while nursery sweeps and the allocator still treat lines of the last epoch as live, until the final sweep.
+    pub(crate) fn start_concurrent_marking(&self) {
+        debug_assert!(self.uses_concurrent_marking && !super::BLOCK_ONLY);
+        let next = self.line_mark_state.load(Ordering::Acquire) + 1;
+        self.line_mark_state.store(if next > Line::MAX_MARK_STATE { Line::RESET_MARK_STATE } else { next }, Ordering::Release);
+        self.concurrent_marking.store(true, Ordering::SeqCst);
+    }
+
+    /// From the start of the final-mark pause, old objects are live only if the concurrent mark reached them.
+    pub(crate) fn start_final_mark(&self) {
+        self.final_mark.store(true, Ordering::SeqCst);
+    }
+
+    /// End a concurrent full-heap mark, after its final sweep, or because a full collection replaces it. A full collection's prepare clears `CONC_MARK`.
+    pub(crate) fn end_concurrent_marking(&self, replaced_by_full_heap_collection: bool) {
+        if replaced_by_full_heap_collection {
+            self.concurrent_mark_replaced.store(true, Ordering::SeqCst);
+        }
+        self.concurrent_marking.store(false, Ordering::SeqCst);
+        self.final_mark.store(false, Ordering::SeqCst);
+    }
+
+    /// Mark an old object for the concurrent full-heap mark, and the lines it spans. Returns whether this call marked it; a young object is never marked, since it was allocated after the mark's snapshot.
+    pub fn attempt_concurrent_mark(&self, object: ObjectReference) -> bool {
+        if !self.is_marked(object) || CONC_MARK.fetch_or_atomic::<u8>(object.to_raw_address(), 1, Ordering::SeqCst) != 0 {
+            return false;
+        }
+        self.mark_lines(object);
+        true
+    }
+
+    pub fn is_concurrent_marked(&self, object: ObjectReference) -> bool {
+        CONC_MARK.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst) != 0
+    }
+
+    // A nursery collection promotes `object` while a concurrent mark runs: it is live for the mark, which never traces it.
+    fn mark_promoted_for_concurrent_marking(&self, object: ObjectReference) {
+        if self.concurrent_marking.load(Ordering::Relaxed) {
+            CONC_MARK.store_atomic::<u8>(object.to_raw_address(), 1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn line_unavail_state(&self) -> u8 {
+        self.line_unavail_state.load(Ordering::Acquire)
     }
 
     /// Whether nursery GCs sweep only the blocks allocated since the last GC.
@@ -792,7 +877,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     }
 
     /// Generate chunk sweep tasks
-    fn generate_sweep_tasks(&self, unlog_bits_op: UnlogBitsOperation) -> Vec<Box<dyn GCWork<VM>>> {
+    fn generate_sweep_tasks(&self, unlog_bits_op: UnlogBitsOperation, after_concurrent_mark: bool) -> Vec<Box<dyn GCWork<VM>>> {
         self.defrag.mark_histograms.lock().clear();
         // # Safety: ImmixSpace reference is always valid within this collection cycle.
         let space = unsafe { &*(self as *const Self) };
@@ -805,6 +890,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 space,
                 chunk,
                 unlog_bits_op,
+                after_concurrent_mark,
                 epilogue: epilogue.clone(),
             })
         });
@@ -1220,6 +1306,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 break;
             }
         }
+        self.mark_promoted_for_concurrent_marking(object);
         true
     }
 
@@ -1439,6 +1526,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             None,
             Ordering::SeqCst,
         );
+        self.mark_promoted_for_concurrent_marking(object);
         // Mark the line
         if !super::MARK_LINE_AT_SCAN_TIME {
             self.mark_lines(object);
@@ -1470,6 +1558,8 @@ pub struct PrepareBlockState<VM: VMBinding> {
     pub chunk: Chunk,
     pub defrag_threshold: Option<usize>,
     pub unlog_bits_op: UnlogBitsOperation,
+    /// Line epochs `(from, to)`: lines marked `from` are marked `to` instead.
+    pub relabel_lines: Option<(u8, u8)>,
 }
 
 impl<VM: VMBinding> PrepareBlockState<VM> {
@@ -1479,6 +1569,10 @@ impl<VM: VMBinding> PrepareBlockState<VM> {
         // See `ImmixSpace::prepare`.
         if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC {
             side.bzero_metadata(self.chunk.start(), Chunk::BYTES);
+        }
+        // A full collection may replace a concurrent mark that had not finished.
+        if self.space.uses_concurrent_marking {
+            CONC_MARK.bzero_metadata(self.chunk.start(), Chunk::BYTES);
         }
     }
 }
@@ -1520,6 +1614,11 @@ impl<VM: VMBinding> GCWork<VM> for PrepareBlockState<VM> {
             block.set_state(BlockState::Unmarked);
             debug_assert!(!block.get_state().is_reusable());
             debug_assert_ne!(block.get_state(), BlockState::Marked);
+            if let Some((from, to)) = self.relabel_lines {
+                for line in block.lines().filter(|line| line.is_marked(from)) {
+                    line.mark(to);
+                }
+            }
         }
 
         probe!(
@@ -1560,7 +1659,7 @@ impl<VM: VMBinding> GCWork<VM> for SweepBlocks<VM> {
                     side.bzero_metadata(block.start(), Block::BYTES);
                 }
             }
-            block.sweep(self.space, &mut histogram, line_mark_state);
+            block.sweep(self.space, &mut histogram, line_mark_state, false);
         }
         self.epilogue.finish_one_work_packet();
     }
@@ -1571,6 +1670,8 @@ struct SweepChunk<VM: VMBinding> {
     space: &'static ImmixSpace<VM>,
     chunk: Chunk,
     unlog_bits_op: UnlogBitsOperation,
+    /// Whether this is the final sweep of a concurrent full-heap mark.
+    after_concurrent_mark: bool,
     /// A destructor invoked when all `SweepChunk` packets are finished.
     epilogue: Arc<FlushPageResource<VM>>,
 }
@@ -1626,7 +1727,7 @@ impl<VM: VMBinding> GCWork<VM> for SweepChunk<VM> {
                 }
             }
 
-            match block.sweep(self.space, &mut histogram, line_mark_state) {
+            match block.sweep(self.space, &mut histogram, line_mark_state, self.after_concurrent_mark) {
                 BlockSweepResult::Swept => swept_blocks += 1,
                 BlockSweepResult::Reused => reused_blocks += 1,
                 BlockSweepResult::NoReuse => unreused_blocks += 1,

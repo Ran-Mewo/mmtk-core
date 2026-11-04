@@ -5,10 +5,10 @@ use crate::util::constants::*;
 use crate::util::heap::blockpageresource::BlockPool;
 use crate::util::heap::chunk_map::Chunk;
 use crate::util::linear_scan::{Region, RegionIterator, UnstraddlableRegion};
+use crate::util::metadata::side_metadata::spec_defs::CONC_MARK;
 use crate::util::metadata::side_metadata::*;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
-#[cfg(feature = "object_pinning")]
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::BlockMayHaveObjects;
 use crate::util::{Address, ObjectReference};
@@ -296,6 +296,16 @@ impl Block {
         RegionIterator::<Line>::new(self.start_line(), self.end_line())
     }
 
+    // Every object that started in [start, end) is dead, and the memory may be reused for young objects, which must start unmarked and logged.
+    fn clear_dead_object_bits<VM: VMBinding>(start: Address, end: Address) {
+        if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::LOCAL_MARK_BIT_SPEC {
+            side.bzero_metadata(start, end - start);
+        }
+        if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC {
+            side.bzero_metadata(start, end - start);
+        }
+    }
+
     pub fn clear_rc_table(&self) {
         crate::util::rc::RC_TABLE.bzero_metadata(self.start(), Block::BYTES);
     }
@@ -417,11 +427,13 @@ impl Block {
     }
 
     /// Sweep this block.
+    /// Sweep this block. A line is live if it is marked with the current line mark state or with `line_unavail_state`, which differ only while a concurrent full-heap mark runs, when lines of the last epoch hold old objects it has not reached yet. `after_concurrent_mark` is the final sweep of such a mark, which also clears the mark and log bits of every dead line and the concurrent mark bits of the block.
     pub fn sweep<VM: VMBinding>(
         &self,
         space: &ImmixSpace<VM>,
         mark_histogram: &mut Histogram,
         line_mark_state: Option<u8>,
+        after_concurrent_mark: bool,
     ) -> BlockSweepResult {
         // This method is not called when using RC.
         assert!(!space.rc_enabled);
@@ -462,14 +474,22 @@ impl Block {
             let mut holes = 0;
             let mut prev_line_is_marked = true;
             let line_mark_state = line_mark_state.unwrap();
+            let unavail_state = space.line_unavail_state();
+            let mut dead_run_start: Option<Address> = None;
 
             for line in self.lines() {
-                if line.is_marked(line_mark_state) {
+                if line.is_marked(line_mark_state) || line.is_marked(unavail_state) {
                     marked_lines += 1;
                     prev_line_is_marked = true;
+                    if let Some(start) = dead_run_start.take() {
+                        Self::clear_dead_object_bits::<VM>(start, line.start());
+                    }
                 } else {
                     if prev_line_is_marked {
                         holes += 1;
+                    }
+                    if after_concurrent_mark && dead_run_start.is_none() {
+                        dead_run_start = Some(line.start());
                     }
                     // We need to clear the line mark state at least twice in every 128 GC
                     // otherwise, the line mark state of the last GC will stick around
@@ -487,6 +507,12 @@ impl Block {
 
                     prev_line_is_marked = false;
                 }
+            }
+            if after_concurrent_mark {
+                if let Some(start) = dead_run_start {
+                    Self::clear_dead_object_bits::<VM>(start, self.end());
+                }
+                CONC_MARK.bzero_metadata(self.start(), Block::BYTES);
             }
 
             if marked_lines == 0 {
