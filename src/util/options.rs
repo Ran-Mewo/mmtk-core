@@ -1013,8 +1013,8 @@ options! {
     concurrent_immix_disable_concurrent_marking: bool              [always_valid] = false,
     /// Collect StickyImmix's old space with a concurrent mark between nursery collections instead of in one full-heap pause. Full-heap pauses still happen when an allocation fails, or for a user-requested collection with `full_heap_system_gc`.
     sticky_immix_concurrent_marking: bool          [always_valid] = false,
-    /// StickyImmix starts a concurrent mark at the first nursery collection after the heap is more than this percentage full.
-    sticky_immix_concurrent_mark_trigger: usize    [|v: &usize| *v <= 100] = 50,
+    /// StickyImmix starts a concurrent mark at the first nursery collection after this percentage of the room the last full-heap trace left free is in use. Marks that start early keep the heap near its live size, and once each object is recorded only once per mark they cost little more than late ones.
+    sticky_immix_concurrent_mark_trigger: usize    [|v: &usize| *v <= 100] = 10,
     /// Trigger an LXR pause once this many reference-count increments are pending, bounding the
     /// `RCProcessIncs` work a single pause has to do. Each pending increment is one slot the write
     /// barrier recorded, so the limit is roughly "words of reference stores between pauses".
