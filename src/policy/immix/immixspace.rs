@@ -102,6 +102,8 @@ pub struct ImmixSpace<VM: VMBinding> {
     final_mark: AtomicBool,
     /// Whether the coming full-heap collection replaces an unfinished concurrent mark, whose live lines then carry either of two epochs.
     concurrent_mark_replaced: AtomicBool,
+    /// Sweep packets still to run after the last concurrent full-heap mark.
+    sweep_packets_left: AtomicUsize,
 }
 
 /// Some arguments for Immix Space.
@@ -513,6 +515,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             concurrent_marking: AtomicBool::new(false),
             final_mark: AtomicBool::new(false),
             concurrent_mark_replaced: AtomicBool::new(false),
+            sweep_packets_left: AtomicUsize::new(0),
         }
     }
 
@@ -756,6 +759,35 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         self.blocks_allocated_since_gc.lock().unwrap().clear();
         self.mark_histograms_stale = false;
         self.lines_consumed.store(0, Ordering::Relaxed);
+    }
+
+    /// The same release, with the sweep done after the pause: the returned packets sweep the blocks in use now, which no allocator can take until they are swept, while mutators allocate from clean blocks. Freed and reusable blocks become available when the last packet finishes.
+    pub(crate) fn release_after_concurrent_marking_later(&mut self) -> Vec<Box<dyn GCWork<VM>>> {
+        const BLOCKS_PER_PACKET: usize = 256;
+        debug_assert!(self.concurrent_marking.load(Ordering::Relaxed));
+        self.line_unavail_state.store(self.line_mark_state.load(Ordering::Acquire), Ordering::Release);
+        self.reusable_blocks.reset();
+        self.defrag.mark_histograms.lock().clear();
+        let blocks: Vec<Block> = self.chunk_map.all_chunks().flat_map(|chunk| chunk.iter_region::<Block>()).filter(|block| block.get_state() != BlockState::Unallocated).collect();
+        self.blocks_allocated_since_gc.lock().unwrap().clear();
+        // Nursery collections may sweep reused blocks before the last packet adds the histograms of the rest.
+        self.mark_histograms_stale = true;
+        self.lines_consumed.store(0, Ordering::Relaxed);
+        let packets = blocks.chunks(BLOCKS_PER_PACKET).count();
+        self.sweep_packets_left.store(packets, Ordering::SeqCst);
+        // # Safety: ImmixSpace reference is always valid within this collection cycle.
+        let space = unsafe { &*(self as *const Self) };
+        blocks.chunks(BLOCKS_PER_PACKET).map(|blocks| Box::new(SweepBlocksAfterMark { space, blocks: blocks.to_vec() }) as Box<dyn GCWork<VM>>).collect()
+    }
+
+    /// Whether blocks are still waiting for the sweep that follows a concurrent full-heap mark.
+    pub(crate) fn is_sweeping_after_mark(&self) -> bool {
+        self.sweep_packets_left.load(Ordering::SeqCst) != 0
+    }
+
+    /// A full-heap collection drops the sweep that follows a mark and sweeps everything itself; its prepare clears the mark bits the dropped packets would have.
+    pub(crate) fn abandon_sweep_after_mark(&self) {
+        self.sweep_packets_left.store(0, Ordering::SeqCst);
     }
 
     /// Let the space take part in concurrent full-heap marking. Called once by the plan, which maps `CONC_MARK`.
@@ -1662,6 +1694,29 @@ impl<VM: VMBinding> GCWork<VM> for SweepBlocks<VM> {
             block.sweep(self.space, &mut histogram, line_mark_state, false);
         }
         self.epilogue.finish_one_work_packet();
+    }
+}
+
+/// Sweeps blocks after a concurrent full-heap mark, beside the program. The last packet makes the blocks it and the others freed or found reusable available to allocators; until then no allocator can take any of these blocks. A full-heap collection may drop the packets still waiting.
+struct SweepBlocksAfterMark<VM: VMBinding> {
+    space: &'static ImmixSpace<VM>,
+    blocks: Vec<Block>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for SweepBlocksAfterMark<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        let mut histogram = self.space.defrag.new_histogram();
+        let line_mark_state = Some(self.space.line_mark_state.load(Ordering::Acquire));
+        for &block in &self.blocks {
+            if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC {
+                side.bzero_metadata(block.start(), Block::BYTES);
+            }
+            block.sweep(self.space, &mut histogram, line_mark_state, true);
+        }
+        self.space.defrag.add_completed_mark_histogram(histogram);
+        if self.space.sweep_packets_left.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.space.flush_page_resource();
+        }
     }
 }
 

@@ -56,6 +56,10 @@ pub struct StickyImmix<VM: VMBinding> {
     start_marking: AtomicBool,
     /// Pages in use at the end of the last full-heap pause or final-mark pause, about what was live then.
     pages_after_full_heap_trace: AtomicUsize,
+    /// Whether `pages_after_full_heap_trace` waits for the sweep after a final-mark pause.
+    measure_live_pages: AtomicBool,
+    /// Whether the current final-mark pause is for memory running short, so it sweeps before the world resumes.
+    final_mark_for_memory: AtomicBool,
 }
 
 /// The plan constraints for the sticky immix plan.
@@ -115,7 +119,7 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
 
     fn schedule_collection(&'static self, scheduler: &crate::scheduler::GCWorkScheduler<Self::VM>) {
         let marking = self.concurrent_marking.load(Ordering::SeqCst);
-        let is_full_heap = self.requires_full_heap_collection(marking);
+        let is_full_heap = self.requires_full_heap_collection(marking || self.immix.immix_space.is_sweeping_after_mark());
         self.gc_full_heap.store(is_full_heap, Ordering::SeqCst);
         probe!(mmtk, gen_full_heap, is_full_heap);
 
@@ -123,7 +127,9 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
         let pause = if is_full_heap {
             Pause::Full
         } else if marking {
-            if self.marking_drained.load(Ordering::SeqCst) || self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1 {
+            let for_memory = self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1;
+            self.final_mark_for_memory.store(for_memory, Ordering::SeqCst);
+            if self.marking_drained.load(Ordering::SeqCst) || for_memory {
                 Pause::FinalMark
             } else {
                 Pause::Full
@@ -186,7 +192,16 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
             self.immix.common.los.release(false);
             if self.pause.load(Ordering::SeqCst) == Some(Pause::FinalMark) {
                 self.immix.common.los.release_after_concurrent_marking();
-                self.immix.immix_space.release_after_concurrent_marking();
+                // A final-mark pause that memory ran short for sweeps now, since the allocation waiting on it needs what the sweep frees; otherwise the sweep follows the pause.
+                if self.final_mark_for_memory.load(Ordering::SeqCst) {
+                    self.immix.immix_space.release_after_concurrent_marking();
+                } else {
+                    let packets = self.immix.immix_space.release_after_concurrent_marking_later();
+                    let bucket = &self.immix.common.base.scheduler.work_buckets[WorkBucketStage::ConcurrentResumable];
+                    for packet in packets {
+                        bucket.add_boxed_no_notify(packet);
+                    }
+                }
                 // Weak references are processed by now, and the sanity trace that may follow expects the old bits alone to mean live.
                 self.end_concurrent_marking(false);
             } else {
@@ -214,10 +229,17 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
             scheduler.work_buckets[WorkBucketStage::FinishConcurrentWork].bulk_add(left);
             self.immix.immix_space.start_final_mark();
             self.immix.common.los.start_final_mark();
-        } else if self.gc_full_heap.load(Ordering::SeqCst) && self.concurrent_marking.load(Ordering::SeqCst) {
-            // A full-heap pause replaces the mark; its prepare clears the concurrent mark bits.
+        } else if self.gc_full_heap.load(Ordering::SeqCst) && (self.concurrent_marking.load(Ordering::SeqCst) || self.immix.immix_space.is_sweeping_after_mark()) {
+            // A full-heap pause replaces the mark or the sweep after it; its prepare clears the concurrent mark bits, and its own sweep covers every block.
             drop(scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].drain_all_packets());
-            self.end_concurrent_marking(true);
+            self.immix.immix_space.abandon_sweep_after_mark();
+            if self.concurrent_marking.load(Ordering::SeqCst) {
+                self.end_concurrent_marking(true);
+            }
+        } else if self.immix.immix_space.is_sweeping_after_mark() && (self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1) {
+            // Memory runs short before the sweep after a mark is done, so this pause finishes it first.
+            let left = scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].drain_all_packets();
+            scheduler.work_buckets[WorkBucketStage::FinishConcurrentWork].bulk_add(left);
         }
         mmtk.gc_trigger.policy.on_gc_start(mmtk);
     }
@@ -239,8 +261,13 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
         self.immix.common.on_pause_end(tls);
 
         let pause = self.pause.swap(None, Ordering::SeqCst);
+        // What a full-heap trace left is known once its sweep is done, which may be pauses later.
         if self.gc_full_heap.load(Ordering::SeqCst) || pause == Some(Pause::FinalMark) {
+            self.measure_live_pages.store(true, Ordering::Relaxed);
+        }
+        if self.measure_live_pages.load(Ordering::Relaxed) && !self.immix.immix_space.is_sweeping_after_mark() {
             self.pages_after_full_heap_trace.store(self.get_reserved_pages(), Ordering::Relaxed);
+            self.measure_live_pages.store(false, Ordering::Relaxed);
         }
         if pause == Some(Pause::InitialMark) {
             self.immix.immix_space.start_concurrent_marking();
@@ -454,11 +481,13 @@ impl<VM: VMBinding> StickyImmix<VM> {
             marking_drained: AtomicBool::new(false),
             start_marking: AtomicBool::new(false),
             pages_after_full_heap_trace: AtomicUsize::new(0),
+            measure_live_pages: AtomicBool::new(false),
+            final_mark_for_memory: AtomicBool::new(false),
         }
     }
 
-    // While a mark runs, the first nursery pause that leaves too little memory is followed by a final-mark pause, and only if that frees too little too, by a full-heap pause.
-    fn requires_full_heap_collection(&self, marking: bool) -> bool {
+    // While a mark or the sweep after it runs, the first nursery pause that leaves too little memory is followed by one that finishes it, and only if that frees too little too, by a full-heap pause.
+    fn requires_full_heap_collection(&self, old_space_work_pending: bool) -> bool {
         // Separate each condition so the code is clear
         #[allow(clippy::if_same_then_else, clippy::needless_bool)]
         if crate::plan::generational::FULL_NURSERY_GC {
@@ -476,7 +505,7 @@ impl<VM: VMBinding> StickyImmix<VM> {
         {
             // User triggered collection, and we force full heap for user triggered collection
             true
-        } else if (!marking && self.next_gc_full_heap.load(Ordering::SeqCst)) || self.collection_attempts() > 1 + marking as usize {
+        } else if (!old_space_work_pending && self.next_gc_full_heap.load(Ordering::SeqCst)) || self.collection_attempts() > 1 + old_space_work_pending as usize {
             // Forces full heap collection
             true
         } else {
@@ -496,9 +525,9 @@ impl<VM: VMBinding> StickyImmix<VM> {
         *self.immix.common.base.options.sticky_immix_concurrent_marking
     }
 
-    // A mark starts once the given share of the room the last full-heap trace left free is in use.
+    // A mark starts once the given share of the room the last full-heap trace left free is in use, and not before the sweep after the last mark is done.
     fn should_start_marking(&self) -> bool {
-        if !self.uses_concurrent_marking() {
+        if !self.uses_concurrent_marking() || self.immix.immix_space.is_sweeping_after_mark() {
             return false;
         }
         let live = self.pages_after_full_heap_trace.load(Ordering::Relaxed);
