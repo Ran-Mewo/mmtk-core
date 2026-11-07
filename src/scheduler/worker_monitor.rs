@@ -152,7 +152,9 @@ impl WorkerMonitor {
         let mut guard = self.sync.lock().unwrap();
         let newly_requested = guard.goals.set_request(goal);
         if newly_requested {
-            self.notify_work_available_while_locked(true);
+            // One parked worker is enough: it parks again as the last one, handles the request and wakes the others as the work needs them. Waking all of them would make the request wait until each had woken and parked again in turn.
+            self.workers_have_anything_to_do.notify_one();
+            self.active_worker_number_changed.notify_all();
         }
     }
 

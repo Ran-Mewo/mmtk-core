@@ -24,8 +24,8 @@ use super::global::StickyImmix;
 type NurseryTrace<VM> = GenNurseryTrace<VM, StickyImmix<VM>, DEFAULT_TRACE>;
 type NurseryPinningTrace<VM> = GenNurseryTrace<VM, StickyImmix<VM>, TRACE_KIND_TRANSITIVE_PIN>;
 
-// How many objects a marking packet traces between checks for a requested pause.
-const YIELD_INTERVAL: usize = 256;
+// How many slots a marking packet visits between checks for a requested pause; counted in slots, so a run of large arrays cannot hold a pause back.
+const YIELD_INTERVAL: usize = 4096;
 // A marking packet whose queue grows past this hands half of it to a new packet, which idle collector threads can take.
 const SPLIT_LENGTH: usize = 4096;
 
@@ -137,33 +137,42 @@ impl<VM: VMBinding> ConcurrentMark<VM> {
 impl<VM: VMBinding> GCWork<VM> for ConcurrentMark<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let plan = sticky_immix(mmtk);
+        // Only the final-mark pause runs marking work inside a pause, and it must finish it.
+        let concurrent = plan.current_pause().is_none();
+        // A pause waits for every collector thread to park. Disabling the marker's bucket does not reach the packets a thread queued for itself, so each also checks before it starts.
+        let pause_requested = || mmtk.state.gc_status.load() == GcStatus::PauseRequested;
+        if concurrent && pause_requested() {
+            plan.add_marking_work(ConcurrentMark::<VM>::new(std::mem::take(&mut self.objects), self.marked));
+            return;
+        }
         let mut stack = std::mem::take(&mut self.objects);
         if !self.marked {
             stack.retain(|&object| plan.attempt_concurrent_mark(object));
         }
-        // Only the final-mark pause runs marking work inside a pause, and it must finish it.
-        let concurrent = plan.current_pause().is_none();
         let stage = if concurrent { WorkBucketStage::ConcurrentResumable } else { WorkBucketStage::FinishConcurrentWork };
-        let mut traced = 0;
+        let mut slots_since_check = 0;
         while let Some(object) = stack.pop() {
             <VM::VMScanning as Scanning<VM>>::scan_object(worker.tls, object, &mut |slot: VM::VMSlot| {
+                slots_since_check += 1;
                 if let Some(child) = slot.load() {
                     if plan.attempt_concurrent_mark(child) {
                         stack.push(child);
                     }
                 }
             });
-            traced += 1;
+            slots_since_check += 1;
             if stack.len() > SPLIT_LENGTH {
                 let half = stack.split_off(stack.len() / 2);
                 worker.add_work(stage, ConcurrentMark::<VM>::new(half, true));
             }
-            // A pause waits for every collector thread to park, so a long trace hands back what it has left.
-            if concurrent && traced % YIELD_INTERVAL == 0 && mmtk.state.gc_status.load() == GcStatus::PauseRequested {
-                if !stack.is_empty() {
-                    plan.add_marking_work(ConcurrentMark::<VM>::new(stack, true));
+            if concurrent && slots_since_check >= YIELD_INTERVAL {
+                slots_since_check = 0;
+                if pause_requested() {
+                    if !stack.is_empty() {
+                        plan.add_marking_work(ConcurrentMark::<VM>::new(stack, true));
+                    }
+                    return;
                 }
-                return;
             }
         }
     }
