@@ -252,10 +252,13 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     end_line,
                     self.tls
                 );
-                crate::util::memory::zero(
-                    self.bump_pointer.cursor,
-                    self.bump_pointer.limit - self.bump_pointer.cursor,
-                );
+                // Copied objects overwrite the hole, so only allocation for mutators zeroes it.
+                if !self.copy {
+                    crate::util::memory::zero(
+                        self.bump_pointer.cursor,
+                        self.bump_pointer.limit - self.bump_pointer.cursor,
+                    );
+                }
                 debug_assert!(
                     align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset) + size
                         <= self.bump_pointer.limit

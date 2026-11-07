@@ -1023,7 +1023,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         copy: bool,
         alloc_options: AllocationOptions,
     ) -> Option<Block> {
-        let block_address = self.acquire(tls, Block::PAGES, alloc_options);
+        // Copied objects overwrite what they are copied into, and a line a copy leaves free is zeroed when an allocator takes it as a hole.
+        let block_address = self.acquire_pages(tls, Block::PAGES, alloc_options, self.common().zeroed && !copy);
         if block_address.is_zero() {
             return None;
         }

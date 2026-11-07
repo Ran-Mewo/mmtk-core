@@ -60,6 +60,11 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
     fn initialize_side_metadata(&self) {}
 
     fn acquire(&self, tls: VMThread, pages: usize, alloc_options: AllocationOptions) -> Address {
+        self.acquire_pages(tls, pages, alloc_options, self.common().zeroed)
+    }
+
+    /// Like [`Self::acquire`], zeroing the pages only if `zero` is set: memory that a collector is about to copy objects into needs no zeroing.
+    fn acquire_pages(&self, tls: VMThread, pages: usize, alloc_options: AllocationOptions, zero: bool) -> Address {
         trace!(
             "Space.acquire, tls={:?}, alloc_options={:?}",
             tls,
@@ -96,7 +101,7 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         // reason (if we decided not to, or if we tried and failed), this function shall return a
         // null address.
         if should_get_pages {
-            if let Some(addr) = self.get_new_pages_and_initialize(tls, pages, pr, pages_reserved) {
+            if let Some(addr) = self.get_new_pages_and_initialize(tls, pages, pr, pages_reserved, zero) {
                 addr
             } else {
                 self.not_acquiring(tls, alloc_options, pr, pages_reserved, true);
@@ -109,7 +114,7 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
     }
 
     /// Get new pages from the page resource, and do necessary initialization, including mmapping
-    /// and zeroing the memory.
+    /// and zeroing the memory if `zero` is set.
     ///
     /// The caller must have reserved pages from the page resource.  If successfully acquired pages
     /// from the page resource, the reserved pages will be committed.
@@ -122,6 +127,7 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         pages: usize,
         pr: &dyn PageResource<VM>,
         pages_reserved: usize,
+        zero: bool,
     ) -> Option<Address> {
         // We need this lock: Othrewise, it is possible that one thread acquires pages in a new chunk, but not yet
         // set SFT for it (in grow_space()), and another thread acquires pages in the same chunk, which is not
@@ -196,7 +202,7 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         }
 
         // TODO: Concurrent zeroing
-        if self.common().zeroed {
+        if zero {
             crate::util::memory::zero(res.start, bytes);
         }
 
