@@ -189,13 +189,20 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
 
     fn release(&mut self, tls: crate::util::VMWorkerThread) {
         if self.is_current_gc_nursery() {
-            self.immix.common.los.release(false);
+            // The large objects found dead are freed after the pause, unless an allocation is waiting on their pages.
+            let memory_short = self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1;
+            if memory_short {
+                self.immix.common.los.release(false);
+            } else {
+                self.immix.common.los.release_nursery_later();
+            }
             if self.pause.load(Ordering::SeqCst) == Some(Pause::FinalMark) {
-                self.immix.common.los.release_after_concurrent_marking();
                 // A final-mark pause that memory ran short for sweeps now, since the allocation waiting on it needs what the sweep frees; otherwise the sweep follows the pause.
                 if self.final_mark_for_memory.load(Ordering::SeqCst) {
+                    self.immix.common.los.release_after_concurrent_marking();
                     self.immix.immix_space.release_after_concurrent_marking();
                 } else {
+                    self.immix.common.los.release_after_concurrent_marking_later();
                     let packets = self.immix.immix_space.release_after_concurrent_marking_later();
                     let bucket = &self.immix.common.base.scheduler.work_buckets[WorkBucketStage::ConcurrentResumable];
                     for packet in packets {
@@ -223,6 +230,10 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
 
     fn on_pause_start(&self, mmtk: &'static MMTK<VM>) {
         let scheduler = &self.immix.common.base.scheduler;
+        // A full-heap pause needs every old large object back in the treadmill, and a pause that memory ran short for needs the pages, so either first frees what earlier pauses left for later.
+        if self.gc_full_heap.load(Ordering::SeqCst) || self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1 {
+            self.immix.common.los.release_deferred();
+        }
         if self.pause.load(Ordering::SeqCst) == Some(Pause::FinalMark) {
             // What the marker left, and what the barriers recorded since, is traced first in this pause; the world is stopped, so nothing more can be recorded.
             let left = scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].drain_all_packets();
@@ -265,7 +276,7 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
         if self.gc_full_heap.load(Ordering::SeqCst) || pause == Some(Pause::FinalMark) {
             self.measure_live_pages.store(true, Ordering::Relaxed);
         }
-        if self.measure_live_pages.load(Ordering::Relaxed) && !self.immix.immix_space.is_sweeping_after_mark() {
+        if self.measure_live_pages.load(Ordering::Relaxed) && !self.immix.immix_space.is_sweeping_after_mark() && !self.immix.common.los.is_sweeping_after_mark() {
             self.pages_after_full_heap_trace.store(self.get_reserved_pages(), Ordering::Relaxed);
             self.measure_live_pages.store(false, Ordering::Relaxed);
         }
@@ -276,6 +287,10 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
             self.concurrent_marking.store(true, Ordering::SeqCst);
         } else if self.concurrent_marking.load(Ordering::SeqCst) && mmtk.scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].is_empty() {
             self.marking_drained.store(true, Ordering::SeqCst);
+        }
+        // Queued after the check above, which asks whether the marker has work left.
+        if self.immix.common.los.has_deferred_release() {
+            mmtk.scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].add_boxed_no_notify(self.immix.common.los.release_deferred_packet());
         }
         self.start_marking.store(!self.concurrent_marking.load(Ordering::SeqCst) && self.should_start_marking(), Ordering::SeqCst);
 
@@ -528,7 +543,7 @@ impl<VM: VMBinding> StickyImmix<VM> {
 
     // A mark starts once the given share of the room the last full-heap trace left free is in use, and not before the sweep after the last mark is done.
     fn should_start_marking(&self) -> bool {
-        if !self.uses_concurrent_marking() || self.immix.immix_space.is_sweeping_after_mark() {
+        if !self.uses_concurrent_marking() || self.immix.immix_space.is_sweeping_after_mark() || self.immix.common.los.is_sweeping_after_mark() {
             return false;
         }
         let live = self.pages_after_full_heap_trace.load(Ordering::Relaxed);

@@ -64,7 +64,7 @@ impl TreadMill {
 
     /// Take all objects from the `collect_nursery`.  This is called during sweeping at which time
     /// all unreachable young objects are in the collection nursery.
-    pub fn collect_nursery(&self) -> impl IntoIterator<Item = ObjectReference> {
+    pub fn collect_nursery(&self) -> HashSet<ObjectReference> {
         let mut sync = self.sync.lock().unwrap();
         std::mem::take(&mut sync.collect_nursery)
     }
@@ -86,6 +86,22 @@ impl TreadMill {
     pub fn retain_mature(&self, f: impl FnMut(&ObjectReference) -> bool) {
         let mut sync = self.sync.lock().unwrap();
         sync.to_space.retain(f);
+    }
+
+    /// Take all objects from the `to_space`, to sweep them outside a pause; [`Self::return_to_space`] puts back the ones that live.
+    pub fn take_to_space(&self) -> HashSet<ObjectReference> {
+        let mut sync = self.sync.lock().unwrap();
+        std::mem::take(&mut sync.to_space)
+    }
+
+    /// Put objects taken by [`Self::take_to_space`] back into the `to_space`, beside those added since.
+    pub fn return_to_space(&self, mut objects: HashSet<ObjectReference>) {
+        let mut sync = self.sync.lock().unwrap();
+        if objects.len() < sync.to_space.len() {
+            swap(&mut objects, &mut sync.to_space);
+        }
+        objects.extend(sync.to_space.drain());
+        sync.to_space = objects;
     }
 
     /// Remove an object from whichever set contains it.  Returns true if the object was found.

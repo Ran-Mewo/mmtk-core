@@ -18,8 +18,12 @@ use crate::util::treadmill::TreadMill;
 use crate::util::{Address, ObjectReference};
 use crate::vm::ObjectModel;
 use crate::vm::VMBinding;
+use crate::scheduler::GCWork;
+use crate::MMTK;
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Mutex;
 
 #[allow(unused)]
 const PAGE_MASK: usize = !(BYTES_IN_PAGE - 1);
@@ -140,6 +144,19 @@ pub struct LargeObjectSpace<VM: VMBinding> {
     concurrent_marking: AtomicBool,
     /// Whether the final-mark pause is deciding liveness, when a mature object is live only if the concurrent mark reached it.
     final_mark: AtomicBool,
+    /// Objects that pauses left to free after them, see [`Self::release_deferred`].
+    deferred: Mutex<DeferredRelease>,
+    /// Whether the old objects a concurrent mark ended with wait for their sweep, or are being swept.
+    sweeping_after_mark: AtomicBool,
+}
+
+/// What pauses leave for [`LargeObjectSpace::release_deferred`] to do once the world resumes.
+#[derive(Default)]
+struct DeferredRelease {
+    /// Young objects that nursery pauses found dead, one set per pause.
+    dead: Vec<HashSet<ObjectReference>>,
+    /// The old objects a concurrent mark ended with, to be swept: those it marked go back to the treadmill, the rest are freed.
+    after_mark: Option<HashSet<ObjectReference>>,
 }
 
 impl<VM: VMBinding> SFT for LargeObjectSpace<VM> {
@@ -479,6 +496,8 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
             uses_concurrent_marking: false,
             concurrent_marking: AtomicBool::new(false),
             final_mark: AtomicBool::new(false),
+            deferred: Mutex::new(DeferredRelease::default()),
+            sweeping_after_mark: AtomicBool::new(false),
         }
     }
 
@@ -515,19 +534,86 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         debug_assert!(self.concurrent_marking.load(Ordering::Relaxed));
         let mut dead = vec![];
         self.treadmill.retain_mature(|&object| {
-            CONC_COVERED.store_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed);
-            let live = CONC_MARK.fetch_and_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed) != 0;
+            let live = Self::end_concurrent_mark_of(object);
             if !live {
                 dead.push(object);
             }
             live
         });
         for object in dead {
-            if self.clear_log_bit_on_sweep {
-                VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
-            }
-            self.release_object(object);
+            self.release_dead_object(object);
         }
+    }
+
+    /// The final sweep of a concurrent full-heap mark, left to [`Self::release_deferred`] after the pause. The next mark waits for it.
+    pub(crate) fn release_after_concurrent_marking_later(&mut self) {
+        debug_assert!(self.concurrent_marking.load(Ordering::Relaxed));
+        self.sweeping_after_mark.store(true, Ordering::SeqCst);
+        self.deferred.lock().unwrap().after_mark = Some(self.treadmill.take_to_space());
+    }
+
+    /// The sweep of a nursery collection, left to [`Self::release_deferred`] after the pause: the young objects it did not reach are freed then.
+    pub(crate) fn release_nursery_later(&mut self) {
+        debug_assert!(self.treadmill.is_alloc_nursery_empty());
+        let dead = self.treadmill.collect_nursery();
+        if !dead.is_empty() {
+            self.deferred.lock().unwrap().dead.push(dead);
+        }
+    }
+
+    /// Free the objects pauses found dead and sweep the old objects a concurrent mark left, so a pause does not wait for their pages to be given back. A packet does it after the pause that left the work, and a pause that needs the memory, or a whole treadmill, does it first.
+    /// The lock is held throughout, so a pause that calls this while the packet runs waits for it to finish.
+    pub(crate) fn release_deferred(&self) {
+        let mut deferred = self.deferred.lock().unwrap();
+        for dead in std::mem::take(&mut deferred.dead) {
+            for object in dead {
+                self.release_dead_object(object);
+            }
+        }
+        if let Some(mut objects) = deferred.after_mark.take() {
+            objects.retain(|&object| {
+                let live = Self::end_concurrent_mark_of(object);
+                if !live {
+                    self.release_dead_object(object);
+                }
+                live
+            });
+            self.treadmill.return_to_space(objects);
+            self.sweeping_after_mark.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn has_deferred_release(&self) -> bool {
+        let deferred = self.deferred.lock().unwrap();
+        !deferred.dead.is_empty() || deferred.after_mark.is_some()
+    }
+
+    pub(crate) fn is_sweeping_after_mark(&self) -> bool {
+        self.sweeping_after_mark.load(Ordering::SeqCst)
+    }
+
+    /// A packet that calls [`Self::release_deferred`] once the world resumes.
+    pub(crate) fn release_deferred_packet(&self) -> Box<dyn GCWork<VM>> {
+        // # Safety: the space lives as long as the MMTk instance.
+        let space = unsafe { &*(self as *const Self) };
+        Box::new(ReleaseDeferred { space })
+    }
+
+    /// Clear an old object's concurrent mark and covered bits, and return whether the mark reached it.
+    fn end_concurrent_mark_of(object: ObjectReference) -> bool {
+        CONC_COVERED.store_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed);
+        CONC_MARK.fetch_and_atomic::<u8>(object.to_raw_address(), 0, Ordering::Relaxed) != 0
+    }
+
+    fn release_dead_object(&self, object: ObjectReference) {
+        // Clear log bits for dead objects to prevent a new nursery object having the unlog bit set
+        // TODO: This code path assumes the log bit is object log bit instead of field log bit.
+        // When generational plans and ConcurrentImmix support field log bit,
+        // we can push this clean-up operation into `Self::release_object`.
+        if self.clear_log_bit_on_sweep {
+            VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
+        }
+        self.release_object(object);
     }
 
     fn release_object(&self, object: ObjectReference) -> usize {
@@ -653,23 +739,13 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
     }
 
     fn sweep_large_pages(&mut self, sweep_nursery: bool) {
-        let sweep = |object: ObjectReference| {
-            // Clear log bits for dead objects to prevent a new nursery object having the unlog bit set
-            // TODO: This code path assumes the log bit is object log bit instead of field log bit.
-            // When generational plans and ConcurrentImmix support field log bit,
-            // we can push this clean-up operation into `Self::release_object`.
-            if self.clear_log_bit_on_sweep {
-                VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
-            }
-            self.release_object(object);
-        };
         if sweep_nursery {
             for object in self.treadmill.collect_nursery() {
-                sweep(object);
+                self.release_dead_object(object);
             }
         } else {
             for object in self.treadmill.collect_mature() {
-                sweep(object)
+                self.release_dead_object(object);
             }
         }
     }
@@ -759,4 +835,15 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
 
 fn get_super_page(cell: Address) -> Address {
     cell.align_down(BYTES_IN_PAGE)
+}
+
+/// Does what pauses left to [`LargeObjectSpace::release_deferred`].
+struct ReleaseDeferred<VM: VMBinding> {
+    space: &'static LargeObjectSpace<VM>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for ReleaseDeferred<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.space.release_deferred();
+    }
 }
