@@ -11,11 +11,11 @@ use crate::util::opaque_pointer::*;
 use crate::util::rust_util::zeroed_alloc::new_zeroed_vec;
 use crate::vm::*;
 use atomic::Ordering;
-use spin::RwLock;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
+use std::sync::RwLock;
 
 const UNINITIALIZED_WATER_MARK: i32 = -1;
 const LOCAL_BUFFER_SIZE: usize = 128;
@@ -323,7 +323,7 @@ impl<B: Region> BlockPool<B> {
     /// Add a BlockArray to the global pool
     fn add_global_array(&self, array: BlockQueue<B>) {
         self.count.fetch_add(array.len(), Ordering::SeqCst);
-        self.global_freed_blocks.write().push(array);
+        self.global_freed_blocks.write().unwrap().push(array);
     }
 
     /// Push a block to the thread-local queue
@@ -341,40 +341,36 @@ impl<B: Region> BlockPool<B> {
             debug_assert!(result.is_ok());
             let old_queue = self.worker_local_freed_blocks[id].replace(queue);
             assert!(!old_queue.is_empty());
-            self.global_freed_blocks.write().push(old_queue);
+            self.global_freed_blocks.write().unwrap().push(old_queue);
         }
     }
 
     /// Pop a block from the global pool
+    ///
+    /// Every allocating thread comes here for its next block, so the head array is popped under a shared lock (its pop is atomic) and only replacing it takes the locks exclusively. The locks park rather than spin: a thread that spins while the holder is descheduled, as a low-priority holder often is, spends its core on nothing.
     pub fn pop(&self) -> Option<B> {
         if self.len() == 0 {
             return None;
         }
-        let head_global_freed_blocks = self.head_global_freed_blocks.upgradeable_read();
+        if let Some(block) = self.head_global_freed_blocks.read().unwrap().as_ref().and_then(|q| q.pop()) {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+            return Some(block);
+        }
+        let mut global_freed_blocks = self.global_freed_blocks.write().unwrap();
+        let mut head_global_freed_blocks = self.head_global_freed_blocks.write().unwrap();
+        // Another thread may have replaced the head array while this one waited.
         if let Some(block) = head_global_freed_blocks.as_ref().and_then(|q| q.pop()) {
             self.count.fetch_sub(1, Ordering::SeqCst);
-            Some(block)
-        } else {
-            let mut global_freed_blocks = self.global_freed_blocks.write();
-            // Retry fast-alloc
-            if let Some(block) = head_global_freed_blocks.as_ref().and_then(|q| q.pop()) {
-                self.count.fetch_sub(1, Ordering::SeqCst);
-                return Some(block);
-            }
-            // Get a new list of blocks for allocation
-            let blocks = global_freed_blocks.pop()?;
-            let block = blocks.pop().unwrap();
-            if !blocks.is_empty() {
-                let mut head_global_freed_blocks = head_global_freed_blocks.upgrade();
-                debug_assert!(head_global_freed_blocks
-                    .as_ref()
-                    .map(|blocks| blocks.is_empty())
-                    .unwrap_or(true));
-                *head_global_freed_blocks = Some(blocks);
-            }
-            self.count.fetch_sub(1, Ordering::SeqCst);
-            Some(block)
+            return Some(block);
         }
+        // Get a new list of blocks for allocation
+        let blocks = global_freed_blocks.pop()?;
+        let block = blocks.pop().unwrap();
+        if !blocks.is_empty() {
+            *head_global_freed_blocks = Some(blocks);
+        }
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        Some(block)
     }
 
     /// Flush a given thread-local queue to the global pool
@@ -382,7 +378,7 @@ impl<B: Region> BlockPool<B> {
         if !self.worker_local_freed_blocks[id].is_empty() {
             let queue = self.worker_local_freed_blocks[id].replace(BlockQueue::new());
             if !queue.is_empty() {
-                self.global_freed_blocks.write().push(queue)
+                self.global_freed_blocks.write().unwrap().push(queue)
             }
         }
     }
@@ -404,10 +400,10 @@ impl<B: Region> BlockPool<B> {
 
     /// Iterate all the blocks in the BlockQueue
     pub fn iterate_blocks(&self, f: &mut impl FnMut(B)) {
-        if let Some(array) = &*self.head_global_freed_blocks.read() {
+        if let Some(array) = &*self.head_global_freed_blocks.read().unwrap() {
             array.iterate_blocks(f);
         }
-        for array in &*self.global_freed_blocks.read() {
+        for array in &*self.global_freed_blocks.read().unwrap() {
             array.iterate_blocks(f);
         }
         for array in &self.worker_local_freed_blocks {
