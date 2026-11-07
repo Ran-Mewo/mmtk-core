@@ -76,6 +76,10 @@ pub struct ImmixSpace<VM: VMBinding> {
     /// only these: no other block holds young objects, so their line marks and states are the
     /// same as when they were last swept.
     blocks_allocated_since_gc: std::sync::Mutex<Vec<Block>>,
+    /// The sweep a nursery collection left for after its pause, see [`Self::release_nursery_later`].
+    nursery_sweep: std::sync::Mutex<NurserySweep>,
+    /// Chunks of `nursery_sweep` not swept yet, counting those being swept.
+    nursery_sweep_chunks_left: AtomicUsize,
     /// Whether nursery GCs have swept only some blocks since the last full sweep, so that
     /// `defrag.mark_histograms` no longer covers every block.
     mark_histograms_stale: bool,
@@ -501,6 +505,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             reused_lines_consumed: AtomicUsize::new(0),
             reusable_blocks: ReusableBlockPool::new(scheduler.num_workers()),
             blocks_allocated_since_gc: std::sync::Mutex::new(Vec::new()),
+            nursery_sweep: std::sync::Mutex::new(NurserySweep::default()),
+            nursery_sweep_chunks_left: AtomicUsize::new(0),
             mark_histograms_stale: false,
             defrag: Defrag::default(),
             // Set to the correct mark state when inititialized. We cannot rely on prepare to set it (prepare may get skipped in nursery GCs).
@@ -783,6 +789,77 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     /// Whether blocks are still waiting for the sweep that follows a concurrent full-heap mark.
     pub(crate) fn is_sweeping_after_mark(&self) -> bool {
         self.sweep_packets_left.load(Ordering::SeqCst) != 0
+    }
+
+    /// The sweep of a nursery collection, left to [`Self::sweep_nursery_chunks`] once the world resumes, so the pause does not wait for it. It covers the blocks allocated since the last collection, which no allocator holds and none can take until they are swept; the line mark state is the one this pause marked with.
+    /// The line marks a sweep reads must not change before it is done, so every pause first finishes what an earlier one left ([`Self::finish_nursery_sweep`]); a pause after which a concurrent mark starts, or ends, sweeps in the pause instead.
+    pub(crate) fn release_nursery_later(&mut self, clear_forwarding_bits: bool) {
+        const BLOCKS_PER_CHUNK: usize = 32;
+        debug_assert!(self.sweeps_allocated_blocks_only_in_nursery_gc() && !self.has_nursery_sweep_left());
+        let blocks = std::mem::take(&mut *self.blocks_allocated_since_gc.lock().unwrap());
+        let chunks: Vec<Vec<Block>> = blocks.chunks(BLOCKS_PER_CHUNK).map(<[Block]>::to_vec).collect();
+        self.nursery_sweep_chunks_left.store(chunks.len(), Ordering::SeqCst);
+        *self.nursery_sweep.lock().unwrap() = NurserySweep {
+            chunks,
+            line_mark_state: if super::BLOCK_ONLY { None } else { Some(self.line_mark_state.load(Ordering::Acquire)) },
+            clear_forwarding_bits,
+        };
+        self.mark_histograms_stale = true;
+        self.lines_consumed.store(0, Ordering::Relaxed);
+    }
+
+    /// Packets that sweep what [`Self::release_nursery_later`] left, as many as collector threads can share it.
+    pub(crate) fn nursery_sweep_packets(&self, workers: usize) -> Vec<Box<dyn GCWork<VM>>> {
+        // # Safety: the space lives as long as the MMTk instance.
+        let space = unsafe { &*(self as *const Self) };
+        let packets = self.nursery_sweep_chunks_left.load(Ordering::SeqCst).min(workers);
+        (0..packets).map(|_| Box::new(SweepNurseryBlocks { space }) as Box<dyn GCWork<VM>>).collect()
+    }
+
+    pub(crate) fn has_nursery_sweep_left(&self) -> bool {
+        self.nursery_sweep_chunks_left.load(Ordering::SeqCst) != 0
+    }
+
+    /// Pages that a nursery sweep left for after its pause may still free.
+    pub(crate) fn nursery_sweep_pages_left(&self) -> usize {
+        self.nursery_sweep_chunks_left.load(Ordering::SeqCst) * 32 * Block::PAGES
+    }
+
+    /// Sweep chunks of the nursery sweep until none is left; whichever thread sweeps the last chunk makes the freed blocks available. Runs on a collector thread.
+    fn sweep_nursery_chunks(&self) {
+        loop {
+            let (chunk, line_mark_state, clear_forwarding_bits) = {
+                let mut sweep = self.nursery_sweep.lock().unwrap();
+                match sweep.chunks.pop() {
+                    Some(chunk) => (chunk, sweep.line_mark_state, sweep.clear_forwarding_bits),
+                    None => return,
+                }
+            };
+            let mut histogram = self.defrag.new_histogram();
+            for &block in &chunk {
+                // Only these blocks hold young objects, so only they can hold forwarded ones.
+                if clear_forwarding_bits {
+                    if let MetadataSpec::OnSide(side) = *VM::VMObjectModel::LOCAL_FORWARDING_BITS_SPEC {
+                        side.bzero_metadata(block.start(), Block::BYTES);
+                    }
+                }
+                block.sweep(self, &mut histogram, line_mark_state, false);
+            }
+            if self.nursery_sweep_chunks_left.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.flush_page_resource();
+            }
+        }
+    }
+
+    /// Finish the nursery sweep an earlier pause left, waiting for chunks other collector threads are sweeping. Called at the start of every pause, on a collector thread.
+    pub(crate) fn finish_nursery_sweep(&self) {
+        if !self.has_nursery_sweep_left() {
+            return;
+        }
+        self.sweep_nursery_chunks();
+        while self.has_nursery_sweep_left() {
+            std::hint::spin_loop();
+        }
     }
 
     /// A full-heap collection drops the sweep that follows a mark and sweeps everything itself; its prepare clears the mark bits the dropped packets would have.
@@ -1696,6 +1773,25 @@ impl<VM: VMBinding> GCWork<VM> for SweepBlocks<VM> {
         }
         self.epilogue.finish_one_work_packet();
     }
+}
+
+/// Sweeps the blocks a nursery collection left to [`ImmixSpace::sweep_nursery_chunks`], once the world has resumed.
+struct SweepNurseryBlocks<VM: VMBinding> {
+    space: &'static ImmixSpace<VM>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for SweepNurseryBlocks<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.space.sweep_nursery_chunks();
+    }
+}
+
+/// What [`ImmixSpace::release_nursery_later`] leaves to sweep.
+#[derive(Default)]
+struct NurserySweep {
+    chunks: Vec<Vec<Block>>,
+    line_mark_state: Option<u8>,
+    clear_forwarding_bits: bool,
 }
 
 /// Sweeps blocks after a concurrent full-heap mark, beside the program. The last packet makes the blocks it and the others freed or found reusable available to allocators; until then no allocator can take any of these blocks. A full-heap collection may drop the packets still waiting.

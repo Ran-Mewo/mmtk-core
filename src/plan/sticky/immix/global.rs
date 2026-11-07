@@ -189,8 +189,9 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
 
     fn release(&mut self, tls: crate::util::VMWorkerThread) {
         if self.is_current_gc_nursery() {
-            // The large objects found dead are freed after the pause, unless an allocation is waiting on their pages.
-            let memory_short = self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1;
+            // What a pause frees is freed after it, unless an allocation is waiting on it or the heap has less than a nursery of room: pages that wait to be freed still count against the heap, so near its limit every allocation would ask for another collection.
+            let room = self.get_total_pages().saturating_sub(self.get_reserved_pages());
+            let memory_short = self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1 || room < self.base().gc_trigger.get_max_nursery_pages();
             if memory_short {
                 self.immix.common.los.release(false);
             } else {
@@ -211,6 +212,10 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
                 }
                 // Weak references are processed by now, and the sanity trace that may follow expects the old bits alone to mean live.
                 self.end_concurrent_marking(false);
+            } else if self.pause.load(Ordering::SeqCst) == Some(Pause::Full) && !memory_short && !self.immix.immix_space.is_sweeping_after_mark() {
+                // A plain nursery pause sweeps after it. An initial-mark pause sweeps in the pause, since the marker it starts marks lines with a new state that a later sweep would read as free; and the sweep after a mark frees blocks through the same thread-local queues, so the two never run together.
+                let moving = self.current_gc_may_move_object();
+                self.immix.immix_space.release_nursery_later(moving);
             } else {
                 self.immix.immix_space.release(
                     false,
@@ -230,6 +235,8 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
 
     fn on_pause_start(&self, mmtk: &'static MMTK<VM>) {
         let scheduler = &self.immix.common.base.scheduler;
+        // No collector thread is busy when a pause starts, so what an earlier pause left to sweep is finished here, before this pause marks lines.
+        self.immix.immix_space.finish_nursery_sweep();
         // A full-heap pause needs every old large object back in the treadmill, and a pause that memory ran short for needs the pages, so either first frees what earlier pauses left for later.
         if self.gc_full_heap.load(Ordering::SeqCst) || self.next_gc_full_heap.load(Ordering::SeqCst) || self.collection_attempts() > 1 {
             self.immix.common.los.release_deferred();
@@ -277,7 +284,7 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
             self.measure_live_pages.store(true, Ordering::Relaxed);
         }
         if self.measure_live_pages.load(Ordering::Relaxed) && !self.immix.immix_space.is_sweeping_after_mark() && !self.immix.common.los.is_sweeping_after_mark() {
-            self.pages_after_full_heap_trace.store(self.get_reserved_pages(), Ordering::Relaxed);
+            self.pages_after_full_heap_trace.store(self.reserved_pages_after_sweeps(), Ordering::Relaxed);
             self.measure_live_pages.store(false, Ordering::Relaxed);
         }
         if pause == Some(Pause::InitialMark) {
@@ -291,6 +298,11 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
         // Queued after the check above, which asks whether the marker has work left.
         if self.immix.common.los.has_deferred_release() {
             mmtk.scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].add_boxed_no_notify(self.immix.common.los.release_deferred_packet());
+        }
+        if self.immix.immix_space.has_nursery_sweep_left() {
+            for packet in self.immix.immix_space.nursery_sweep_packets(mmtk.scheduler.num_workers()) {
+                mmtk.scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].add_boxed_no_notify(packet);
+            }
         }
         self.start_marking.store(!self.concurrent_marking.load(Ordering::SeqCst) && self.should_start_marking(), Ordering::SeqCst);
 
@@ -549,7 +561,12 @@ impl<VM: VMBinding> StickyImmix<VM> {
         let live = self.pages_after_full_heap_trace.load(Ordering::Relaxed);
         let room = self.get_total_pages().saturating_sub(live);
         let trigger = live + room * *self.immix.common.base.options.sticky_immix_concurrent_mark_trigger / 100;
-        self.get_reserved_pages() > trigger
+        self.reserved_pages_after_sweeps() > trigger
+    }
+
+    /// Reserved pages, less what the nursery sweep left for after the pause will free; nearly all of a nursery's blocks are empty once its survivors are copied out.
+    fn reserved_pages_after_sweeps(&self) -> usize {
+        self.get_reserved_pages().saturating_sub(self.immix.immix_space.nursery_sweep_pages_left())
     }
 
     fn end_concurrent_marking(&self, replaced_by_full_heap_collection: bool) {
