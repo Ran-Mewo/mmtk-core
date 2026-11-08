@@ -8,6 +8,7 @@ use crate::policy::immix::{ImmixHooks, ImmixSpace};
 use crate::scheduler::{GCWork, GCWorkScheduler, WorkBucketStage};
 use crate::util::constants::LOG_BYTES_IN_PAGE;
 use crate::util::linear_scan::Region;
+use crate::util::Address;
 use crate::vm::VMBinding;
 use atomic::{Atomic, Ordering};
 use std::cell::UnsafeCell;
@@ -62,6 +63,8 @@ pub struct BlockAllocation<VM: VMBinding> {
     lxr: UnsafeCell<*const LXR<VM>>,
     nursery_blocks: BlockCache,
     reused_blocks: BlockCache,
+    /// Blocks objects were copied into during the current pause. A full pause selects its defrag set after its young objects are copied, and a block it copies into must not be emptied again in the same pause.
+    copy_blocks: BlockCache,
 }
 
 unsafe impl<VM: VMBinding> Sync for BlockAllocation<VM> {}
@@ -74,6 +77,7 @@ impl<VM: VMBinding> BlockAllocation<VM> {
             lxr: UnsafeCell::new(std::ptr::null()),
             nursery_blocks: BlockCache::new(),
             reused_blocks: BlockCache::new(),
+            copy_blocks: BlockCache::new(),
         }
     }
 
@@ -99,6 +103,19 @@ impl<VM: VMBinding> BlockAllocation<VM> {
     pub fn total_young_allocation_in_bytes(&self) -> usize {
         (self.nursery_blocks.len() << Block::LOG_BYTES)
             + (self.space().get_mutator_recycled_lines_in_pages() << LOG_BYTES_IN_PAGE)
+    }
+
+    /// The blocks objects were copied into during the current pause, by start address.
+    pub fn copy_target_blocks(&self) -> Vec<Address> {
+        let targets = std::cell::RefCell::new(Vec::new());
+        self.copy_blocks.visit_slice(|blocks| targets.borrow_mut().extend(blocks.iter().map(|b| b.load(Ordering::Relaxed).start())));
+        let mut targets = targets.into_inner();
+        targets.sort_unstable();
+        targets
+    }
+
+    pub fn reset_copy_target_blocks(&self) {
+        self.copy_blocks.reset();
     }
 
     pub fn reset_block_mark_for_mutator_reused_blocks(&self, _pause: Pause) {
@@ -186,6 +203,7 @@ impl<VM: VMBinding> ImmixHooks<VM> for BlockAllocation<VM> {
         }
         if copy {
             block.initialize_field_unlog_table_as_unlogged::<VM>();
+            self.copy_blocks.push(block);
         }
         if self.cm_in_progress_or_final_mark() {
             block.initialize_mark_table_as_marked::<VM>();
@@ -197,6 +215,8 @@ impl<VM: VMBinding> ImmixHooks<VM> for BlockAllocation<VM> {
     fn on_reusable_block_acquired(&self, block: Block, copy: bool) {
         if !copy {
             self.reused_blocks.push(block);
+        } else {
+            self.copy_blocks.push(block);
         }
     }
 

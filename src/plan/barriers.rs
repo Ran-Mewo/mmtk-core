@@ -136,6 +136,11 @@ pub trait Barrier<VM: VMBinding>: 'static + Send + Downcast {
     ///
     // TODO: Review any potential use cases for other VM bindings.
     fn object_probable_write(&mut self, _obj: ObjectReference) {}
+
+    /// Reports that `slot` of `src` was written without a barrier while it held null, as when a VM fills an object it just allocated in bulk: a barrier that records old values (such as LXR's) records the slot alone, with nothing to decrement. The default is [`Barrier::object_probable_write`] of `src`.
+    fn object_reference_filled(&mut self, src: ObjectReference, _slot: VM::VMSlot) {
+        self.object_probable_write(src);
+    }
 }
 
 impl_downcast!(Barrier<VM> where VM: VMBinding);
@@ -181,6 +186,11 @@ pub trait BarrierSemantics: 'static + Send {
 
     /// Object will probably be modified
     fn object_probable_write_slow(&mut self, _obj: ObjectReference) {}
+
+    /// See [`Barrier::object_reference_filled`]; reached through [`FieldBarrier`].
+    fn object_reference_filled_slow(&mut self, _src: ObjectReference, _slot: <Self::VM as VMBinding>::VMSlot) {
+        unimplemented!("this barrier does not record slots filled without a barrier")
+    }
 
     /// Called by [`ObjectBarrier`] for an unlogged object before it tries to log it, so anything the object holds is still unchanged. Another thread that finds the object logged goes ahead with its write, so whatever this records must be recorded here and not after logging.
     fn before_logging(&mut self, _src: ObjectReference) {}
@@ -320,6 +330,10 @@ impl<S: BarrierSemantics> Barrier<S::VM> for FieldBarrier<S> {
             return;
         }
         self.semantics.object_probable_write_slow(obj);
+    }
+
+    fn object_reference_filled(&mut self, src: ObjectReference, slot: <S::VM as VMBinding>::VMSlot) {
+        self.semantics.object_reference_filled_slow(src, slot);
     }
 
     fn object_reference_write_pre(

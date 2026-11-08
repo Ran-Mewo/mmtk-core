@@ -244,6 +244,13 @@ impl<VM: VMBinding> BarrierSemantics for LXRFieldBarrierSemantics<VM> {
         self.enqueue_node(Some(src), slot, target);
     }
 
+    // The slot held null before the write that bypassed the barrier, so it needs an increment and no decrement. A slot of a young object is logged already and is counted when the object is promoted.
+    fn object_reference_filled_slow(&mut self, src: ObjectReference, slot: VM::VMSlot) {
+        if self.attempt_to_log_field(slot) {
+            self.slow(Some(src), slot, None);
+        }
+    }
+
     fn memory_region_copy_slow(&mut self, _src: VM::VMMemorySlice, dst: VM::VMMemorySlice) {
         // Quickly check if all fields are logged. If yes, skip the barrier.
         let unlog_bits_start = address_to_meta_address(&Self::UNLOG_BITS, dst.start());

@@ -33,12 +33,6 @@ impl<VM: VMBinding> SweepDeadCycles<VM> {
     }
 
     fn process_dead_object(&mut self, o: ObjectReference) {
-        if RefCountHelper::<VM>::SANITY {
-            unsafe {
-                o.to_raw_address().store(0xdeadusize);
-            }
-        }
-
         // Clear the VO bit.
         // Note that if the object is in the LOS,
         // the VO bit will be cleared in `LargeObjectSpace::release_object`.
@@ -47,6 +41,12 @@ impl<VM: VMBinding> SweepDeadCycles<VM> {
 
         self.rc.unmark_straddle_object(o);
         self.rc.set(o, 0);
+        // Poisoned only now: the size above is read from the header, and the first word is part of it in some VMs.
+        if RefCountHelper::<VM>::SANITY {
+            unsafe {
+                o.to_raw_address().store(0xdeadusize);
+            }
+        }
     }
 
     fn process_block(&mut self, block: Block, lxr: &LXR<VM>, immix_space: &ImmixSpace<VM>) {

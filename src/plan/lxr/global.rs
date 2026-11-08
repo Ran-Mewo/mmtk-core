@@ -14,6 +14,8 @@ use crate::plan::lxr::gc_work::mature_sweeping::{RCSweepMatureAfterSATBLOS, Swee
 use crate::plan::lxr::gc_work::nursery_sweeping::SweepBlocksAfterDecs;
 use crate::plan::lxr::gc_work::prepare::{ConcurrentChunkMetadataZeroing, PrepareChunksForFullGC};
 use crate::plan::lxr::mature_evac::MatureEvecRemSet;
+use crate::plan::tracing::gc_work::weakref::VMProcessWeakRefs;
+use crate::plan::tracing::UnsupportedTrace;
 use crate::plan::AllocationSemantics;
 use crate::plan::MutatorContext;
 use crate::plan::Plan;
@@ -75,7 +77,7 @@ pub struct LXR<VM: VMBinding> {
     pub prev_roots: RwLock<SegQueue<Vec<ObjectReference>>>,
     pub curr_roots: RwLock<SegQueue<Vec<ObjectReference>>>,
     pub rc: RefCountHelper<VM>,
-    block_allocation: BlockAllocation<VM>,
+    pub(super) block_allocation: BlockAllocation<VM>,
     pub(super) evac_set: MatureEvacuationSet,
     pub(super) mature_evac_remset: MatureEvecRemSet<VM>,
     pub(super) num_clean_blocks_released_lazy: AtomicUsize,
@@ -178,6 +180,8 @@ impl<VM: VMBinding> Plan for LXR<VM> {
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
         }
+        // LXR has no tracer for the binding to keep objects with: the binding only clears weak references and counts the referents it keeps.
+        scheduler.work_buckets[WorkBucketStage::VMRefClosure].set_sentinel(Box::new(VMProcessWeakRefs::<UnsupportedTrace<VM>>::new()));
         // Analysis routine that is ran. It is generally recommended to take advantage
         // of the scheduling system we have in place for more performance
         #[cfg(feature = "analysis")]
@@ -221,8 +225,13 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         // LOS is aware of LXR. Call its prepare unconditionally.
         self.common.los.prepare(starts_mark_cycle);
 
-        if super::MATURE_EVACUATION && (pause == Pause::FinalMark || pause == Pause::Full) {
+        if super::MATURE_EVACUATION && pause == Pause::FinalMark {
             self.process_mature_evacuation_remset();
+        }
+        // A full pause that interrupts a concurrent mark traces every live slot itself, against a defrag set it selects anew, so what the mark recorded is dropped.
+        if super::MATURE_EVACUATION && pause == Pause::Full {
+            self.mature_evac_remset.flush_all();
+            drop(self.mature_evac_remset.take_global_packets());
         }
         if super::MATURE_EVACUATION && (pause == Pause::InitialMark || pause == Pause::Full) {
             // Select mature evacuation set
@@ -248,6 +257,7 @@ impl<VM: VMBinding> Plan for LXR<VM> {
         self.block_allocation
             .sweep_nursery_blocks(self.immix_space.scheduler(), pause);
         self.block_allocation.sweep_mutator_reused_blocks(pause);
+        self.block_allocation.reset_copy_target_blocks();
         // Check if we want to do all decs and sweeping in the pause
         if super::disable_lasy_dec_for_current_gc() {
             self.immix_space
@@ -445,7 +455,7 @@ impl<VM: VMBinding> LXR<VM> {
         // TODO: We should examine if we can steal a bit from the field log its as the 'logical' object log bit.
         // We potentially could use the field log bit at the object start, or (object ref - lower bound) -- there should
         // be no field at those addresses.
-        #[cfg(feature = "lxr_object_log")]
+        // Registered with or without `lxr_object_log`: the constraints set `needs_log_bit`, so the VM space sets these bits over the boot image (`set_unlog_bits_vm_space`) and the large object space reads them, and both need the table mapped.
         specs.push(*VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.as_spec());
         let immix_specs = metadata::extract_side_metadata(&specs);
         let global_side_metadata_specs = SideMetadataContext::new_global_specs(&immix_specs);
@@ -728,12 +738,13 @@ impl<VM: VMBinding> LXR<VM> {
         // Always enabled
         scheduler.work_buckets[WorkBucketStage::Concurrent].set_enabled(true);
         scheduler.work_buckets[WorkBucketStage::ConcurrentResumable].set_enabled(true);
+        // The binding judges the weak references found in this pause once every increment is done, and counts the referents it keeps (`memory_manager::count_weak_slots`).
+        scheduler.work_buckets[WorkBucketStage::VMRefClosure].set_enabled(true);
         // Always disabled
         // LXR never routes work here: it has no transitively pinning closure. Transitive
         // pinning roots, where accepted at all, take the ordinary node-root path instead.
         #[cfg(feature = "non_moving_root")]
         scheduler.work_buckets[WorkBucketStage::TPinningClosure].set_enabled(false);
-        scheduler.work_buckets[WorkBucketStage::VMRefClosure].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::VMRefForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::SoftRefClosure].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::CalculateForwarding].set_enabled(false);

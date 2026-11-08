@@ -92,9 +92,7 @@ impl<VM: VMBinding> EvacuateMatureObjects<VM> {
     }
 
     fn address_is_valid_oop_slot(&self, s: VM::VMSlot, original_reuse: u8, lxr: &LXR<VM>) -> bool {
-        // Keep slots not in the mmtk heap
-        // These should be slots in the c++ `ClassLoaderData` objects. We remember these slots
-        // in the remembered-set to avoid expensive CLD scanning.
+        // A slot outside the Immix and large object spaces, such as one in the VM space, lies in memory no collection reuses, so it is still the slot that was recorded and must be updated when its target moves.
         let addr = s.to_address();
         // Check reuse count
         if lxr.immix_space.address_in_space(addr) {
@@ -108,7 +106,7 @@ impl<VM: VMBinding> EvacuateMatureObjects<VM> {
                 return false;
             }
         } else {
-            return false;
+            return true;
         }
         // Skip slots in collection set
         if lxr.address_in_defrag(addr) {

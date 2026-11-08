@@ -754,6 +754,17 @@ impl ObjectReference {
         }
         <VM::VMScanning as Scanning<VM>>::scan_object(fake_tls, self, &mut f);
     }
+
+    /// Iterate over the slots of the object as a reference-counting plan counts them; see [`Scanning::scan_object_for_rc`].
+    pub fn iterate_fields_for_rc<VM: VMBinding, F: FnMut(VM::VMSlot)>(self, _tls: VMThread, decrement: bool, mut f: F) {
+        // FIXME: We should use tls from the arguments.
+        // See https://github.com/mmtk/mmtk-core/issues/1375
+        let fake_tls = VMWorkerThread(VMThread::UNINITIALIZED);
+        if !<VM::VMScanning as Scanning<VM>>::support_slot_enqueuing(fake_tls, self) {
+            panic!("SlotIterator::iterate_fields_for_rc cannot be used on objects that don't support slot-enqueuing");
+        }
+        <VM::VMScanning as Scanning<VM>>::scan_object_for_rc(fake_tls, self, decrement, &mut f);
+    }
 }
 
 /// allows print Address as upper-case hex value

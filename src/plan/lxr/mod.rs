@@ -49,6 +49,15 @@ fn disable_lasy_dec_for_current_gc() -> bool {
     DISABLE_LASY_DEC_FOR_CURRENT_GC.load(Ordering::SeqCst)
 }
 
+/// Counts slots the VM left out of the promotion scan until it judged their targets (see `Scanning::scan_object_for_rc`), as the promotion scan counts its slots: each target is incremented, a slot whose target was copied is updated, and a slot into a block mature evacuation will empty is recorded for it.
+pub(crate) fn count_weak_slots<VM: crate::vm::VMBinding>(worker: &mut crate::scheduler::GCWorker<VM>, slots: Vec<VM::VMSlot>) {
+    if slots.is_empty() {
+        return;
+    }
+    let lxr = worker.mmtk.get_plan().downcast_ref::<LXR<VM>>().expect("only LXR counts weak slots");
+    worker.add_work(crate::scheduler::WorkBucketStage::VMRefClosure, gc_work::rc::ProcessIncs::<VM, { gc_work::rc::EDGE_KIND_NURSERY }>::new(slots, lxr));
+}
+
 // --- Lazy sweeping job counters ---
 
 struct LazySweepingJobsCounter {

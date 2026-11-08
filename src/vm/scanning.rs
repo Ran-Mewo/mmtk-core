@@ -224,6 +224,18 @@ pub trait Scanning<VM: VMBinding> {
         slot_visitor: &mut impl SlotVisitor<VM::VMSlot>,
     );
 
+    /// Scanning of an object by a reference-counting plan (LXR), which counts the targets of the slots it visits: `decrement` is false when a young object is promoted and its children are incremented, and true when a dead object's children are decremented.
+    ///
+    /// The default is [`Scanning::scan_object`]. A VM overrides it when a slot stays weak until the VM decides to count it: such a slot is left out of the promotion scan (the VM judges its target in [`Scanning::process_weak_refs`] and counts it then, with [`crate::memory_manager::count_weak_slots`]), and is visited by the decrement scan once counted.
+    fn scan_object_for_rc(
+        tls: VMWorkerThread,
+        object: ObjectReference,
+        _decrement: bool,
+        slot_visitor: &mut impl SlotVisitor<VM::VMSlot>,
+    ) {
+        Self::scan_object(tls, object, slot_visitor)
+    }
+
     /// Delegated scanning of a object, visiting each reference field encountered, and tracing the
     /// objects pointed by each field.
     ///

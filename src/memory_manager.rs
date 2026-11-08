@@ -843,6 +843,11 @@ pub fn add_phantom_candidate<VM: VMBinding>(mmtk: &MMTK<VM>, reff: ObjectReferen
     mmtk.reference_processors.add_phantom_candidate(reff);
 }
 
+/// Under LXR, counts slots the binding left out of the promotion scan until it judged their targets live, such as a Java reference's referent (see [`crate::vm::Scanning::scan_object_for_rc`]). Called from [`crate::vm::Scanning::process_weak_refs`]; a slot whose target was copied is updated by work this queues in the same stage.
+pub fn count_weak_slots<VM: VMBinding>(worker: &mut GCWorker<VM>, slots: Vec<VM::VMSlot>) {
+    crate::plan::count_weak_slots(worker, slots);
+}
+
 /// Generic hook to allow benchmarks to be harnessed. We do a full heap
 /// GC, and then start recording statistics for MMTk.
 ///

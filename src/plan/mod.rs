@@ -56,6 +56,7 @@ mod semispace;
 
 pub(crate) use generational::global::is_nursery_gc;
 pub(crate) use generational::global::GenerationalPlan;
+pub(crate) use lxr::count_weak_slots;
 
 // Expose plan constraints as public. Though a binding can get them from plan.constraints(),
 // it is possible for performance reasons that they want the constraints as constants.

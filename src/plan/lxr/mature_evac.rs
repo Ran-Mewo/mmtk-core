@@ -29,11 +29,14 @@ use std::sync::atomic::AtomicUsize;
 pub struct RemSetEntry<VM: VMBinding>(VM::VMSlot, u8);
 
 impl<VM: VMBinding> RemSetEntry<VM> {
-    fn encode(slot: VM::VMSlot, ix: bool) -> Self {
+    // Only the Immix and large object spaces reuse memory, so only their slots carry a reuse count; a slot in any other space (such as the VM space) is always the slot it was.
+    fn encode(slot: VM::VMSlot, ix: bool, los: bool) -> Self {
         let reuse = if ix {
             IX_LINE_REUSE_COUNT.load_atomic::<u8>(slot.to_address(), Ordering::SeqCst)
-        } else {
+        } else if los {
             LOS_PAGE_REUSE_COUNT.load_atomic::<u8>(slot.to_address(), Ordering::SeqCst)
+        } else {
+            0
         };
         Self(slot, reuse)
     }
@@ -114,7 +117,8 @@ impl<VM: VMBinding> MatureEvecRemSet<VM> {
     pub fn record(&self, s: VM::VMSlot, _o: ObjectReference, lxr: &LXR<VM>) {
         let id = crate::scheduler::current_worker_ordinal().unwrap();
         let ix = lxr.immix_space.address_in_space(s.to_address());
-        self.gc_buffer(id).push(RemSetEntry::<VM>::encode(s, ix));
+        let los = !ix && lxr.los().address_in_space(s.to_address());
+        self.gc_buffer(id).push(RemSetEntry::<VM>::encode(s, ix, los));
         if self.gc_buffer(id).len() >= EvacuateMatureObjects::<VM>::CAPACITY {
             self.flush(id)
         }
@@ -176,6 +180,7 @@ impl MatureEvacuationSet {
         selected_blocks: &mut Vec<Block>,
         copy_bytes: &mut usize,
         max_copy_bytes: usize,
+        copy_targets: &[crate::util::Address],
     ) {
         let mut blocks = Vec::with_capacity(self.fragmented_blocks_size.load(Ordering::SeqCst));
         while let Some(mut x) = self.fragmented_blocks.pop() {
@@ -183,7 +188,7 @@ impl MatureEvacuationSet {
         }
         blocks.sort_by_key(|x| x.1);
         while let Some((block, _dead_bytes)) = blocks.pop() {
-            if Self::skip_block(block) {
+            if Self::skip_block(block) || copy_targets.binary_search(&block.start()).is_ok() {
                 continue;
             }
             block.set_as_defrag_source(true);
@@ -215,7 +220,9 @@ impl MatureEvacuationSet {
         let max_copy_bytes = available_clean_pages_for_defrag << LOG_BYTES_IN_PAGE;
         let mut copy_bytes = 0usize;
         let mut selected_blocks = vec![];
-        self.select_fragmented_blocks(&mut selected_blocks, &mut copy_bytes, max_copy_bytes);
+        // Blocks this pause copied objects into are left out: emptying them again in the same pause would copy their objects twice.
+        let copy_targets = lxr.block_allocation.copy_target_blocks();
+        self.select_fragmented_blocks(&mut selected_blocks, &mut copy_bytes, max_copy_bytes, &copy_targets);
         self.num_defrag_blocks
             .store(selected_blocks.len(), Ordering::SeqCst);
         let mut defrag_blocks = self.defrag_blocks.lock().unwrap();

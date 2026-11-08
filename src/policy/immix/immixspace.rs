@@ -145,19 +145,8 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
     fn is_live(&self, object: ObjectReference) -> bool {
         if self.rc_enabled {
             if self.is_end_of_satb_or_full_gc {
-                if self.is_marked(object) {
-                    let block = Block::containing(object);
-                    if block.is_defrag_source() {
-                        if object_forwarding::is_forwarded::<VM>(object) {
-                            let forwarded =
-                                object_forwarding::read_forwarding_pointer::<VM>(object);
-                            return self.is_marked(forwarded) && self.rc.count(forwarded) > 0;
-                        } else {
-                            return false;
-                        }
-                    }
-                    return self.rc.count(object) > 0;
-                } else if object_forwarding::is_forwarded::<VM>(object) {
+                // A copy's count and mark are the ones that matter, whichever evacuation made it: a young object copied in this pause keeps its old mark (it was allocated during the mark) but not its count.
+                if object_forwarding::is_forwarded::<VM>(object) {
                     let forwarded = object_forwarding::read_forwarding_pointer::<VM>(object);
                     debug_assert!(
                         forwarded.to_raw_address().is_mapped(),
@@ -166,9 +155,15 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
                         forwarded
                     );
                     return self.is_marked(forwarded) && self.rc.count(forwarded) > 0;
-                } else {
-                    return false;
                 }
+                if self.is_marked(object) {
+                    // An object left in a block being evacuated was not reached.
+                    if Block::containing(object).is_defrag_source() {
+                        return false;
+                    }
+                    return self.rc.count(object) > 0;
+                }
+                return false;
             }
             return self.rc.count(object) > 0 || object_forwarding::is_forwarded::<VM>(object);
         }

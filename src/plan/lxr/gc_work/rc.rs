@@ -272,7 +272,7 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.mark_as_unlogged::<VM>(o, Ordering::SeqCst);
         let obj_in_defrag = !los && Block::in_defrag_block(o);
         let tls = worker.tls.0;
-        o.iterate_fields::<VM, _>(tls, |slot| {
+        o.iterate_fields_for_rc::<VM, _>(tls, false, |slot| {
             let Some(target) = slot.load() else {
                 return;
             };
@@ -330,10 +330,8 @@ impl<VM: VMBinding, const KIND: EdgeKind> ProcessIncs<VM, KIND> {
         if Block::containing(o).get_state() != BlockState::Nursery {
             return true;
         }
-        if cfg!(debug_assertions) {
-            let cls = unsafe { (o.to_raw_address() + 8usize).load::<u32>() };
-            assert!(cls != 0, "ERROR {:?} rc={}", o, self.rc.count(o));
-        }
+        // Another worker may be forwarding the object right now, so only what lies outside its header is checked.
+        debug_assert!(o.is_in_any_space(), "ERROR {:?} rc={}", o, self.rc.count(o));
         false
     }
 
@@ -741,7 +739,7 @@ impl<VM: VMBinding> ProcessDecs<VM> {
         }
         // Recursively decrease field ref counts
         let tls = worker.tls.0;
-        o.iterate_fields::<VM, _>(tls, |slot| {
+        o.iterate_fields_for_rc::<VM, _>(tls, true, |slot| {
             if let Some(x) = slot.load() {
                 // println!(" -- rec dec {:?}.{:?} -> {:?}", o, slot, x);
                 let rc = self.rc.count(x);
