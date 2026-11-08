@@ -927,6 +927,9 @@ impl<VM: VMBinding> GCWork<VM> for CollectNodeRoots<VM> {
         if !self.nodes.is_empty() {
             let lxr = mmtk.get_plan().downcast_ref::<LXR<VM>>().unwrap();
             let roots = std::mem::take(&mut self.nodes);
+            if MATURE_EVACUATION {
+                lxr.evac_set.keep_in_place(&roots, lxr, worker);
+            }
             let mut w = ProcessIncs::<_, EDGE_KIND_ROOT>::new(vec![], lxr);
             // `RootsWorkFactory` passes no `RootKind` for node roots; they are strong roots.
             w.root_kind = Some(RootKind::Strong);

@@ -10,9 +10,12 @@ use crate::policy::immix::line::Line;
 use crate::policy::immix::ImmixSpace;
 use crate::policy::space::Space;
 use crate::scheduler::WorkBucketStage;
-use crate::util::linear_scan::Region;
+use crate::scheduler::GCWorker;
+use crate::util::linear_scan::{Region, UnstraddlableRegion};
 use crate::util::metadata::side_metadata::spec_defs::{IX_LINE_REUSE_COUNT, LOS_PAGE_REUSE_COUNT};
+use crate::util::rc;
 use crate::util::ObjectReference;
+use crate::util::VMThread;
 use crate::{
     plan::lxr::LXR,
     scheduler::GCWork,
@@ -20,6 +23,7 @@ use crate::{
 };
 
 use super::gc_work::mature_evac::EvacuateMatureObjects;
+use super::gc_work::tracing::LXRStopTheWorldProcessEdges;
 use crate::util::constants::LOG_BYTES_IN_PAGE;
 use atomic::Ordering;
 use crossbeam::queue::SegQueue;
@@ -133,6 +137,8 @@ pub struct MatureEvacuationSet {
     pub blocks_in_fragmented_chunks_size: AtomicUsize,
     pub defrag_blocks: Mutex<Vec<Block>>,
     pub num_defrag_blocks: AtomicUsize,
+    /// Blocks holding objects that a full pause must not move, left out when the pause selects its set.
+    pinned_blocks: SegQueue<Block>,
 }
 
 impl MatureEvacuationSet {
@@ -175,12 +181,56 @@ impl MatureEvacuationSet {
         b.is_defrag_source() || s == BlockState::Unallocated || s == BlockState::Nursery
     }
 
+    /// Keeps objects that must not move, such as those native code holds by address, where they are. A full pause has yet to select its set and leaves their blocks out of it. A final-mark pause selected its set when the mark began, so it takes their blocks out of it again, and traces the slots of those blocks' marked objects that point into the set: the mark recorded none of them, since the objects of a block in the set are copied and scanned again.
+    pub fn keep_in_place<VM: VMBinding>(&self, objects: &[ObjectReference], lxr: &LXR<VM>, worker: &mut GCWorker<VM>) {
+        let pause = lxr.current_pause().unwrap();
+        for &object in objects {
+            if !lxr.immix_space.in_space(object) {
+                continue;
+            }
+            let block = Block::containing(object);
+            if pause == Pause::Full {
+                self.pinned_blocks.push(block);
+            } else if pause == Pause::FinalMark && block.attempt_unset_defrag_source() {
+                let slots = Self::marked_slots_into_set(block, lxr);
+                if !slots.is_empty() {
+                    worker.add_work(WorkBucketStage::Closure, LXRStopTheWorldProcessEdges::<VM, false>::new_remset(slots, worker.mmtk));
+                }
+            }
+        }
+    }
+
+    fn marked_slots_into_set<VM: VMBinding>(block: Block, lxr: &LXR<VM>) -> Vec<VM::VMSlot> {
+        let mut slots = vec![];
+        let mut cursor = block.start();
+        while cursor < block.end() {
+            let granule = cursor;
+            cursor += rc::MIN_OBJECT_SIZE;
+            let count = lxr.rc.count_by_address(granule);
+            if count == 0 {
+                continue;
+            }
+            let object = unsafe { ObjectReference::from_raw_address_unchecked(granule) };
+            if Line::is_aligned(granule) && count == 1 && lxr.rc.object_is_in_straddle_line_no_rc_check(object) {
+                continue;
+            }
+            if lxr.immix_space.is_marked(object) {
+                object.iterate_fields::<VM, _>(VMThread::UNINITIALIZED, |slot| {
+                    if slot.load().is_some_and(|target| lxr.in_defrag(target)) {
+                        slots.push(slot);
+                    }
+                });
+            }
+        }
+        slots
+    }
+
     fn select_fragmented_blocks(
         &self,
         selected_blocks: &mut Vec<Block>,
         copy_bytes: &mut usize,
         max_copy_bytes: usize,
-        copy_targets: &[crate::util::Address],
+        kept_blocks: &[crate::util::Address],
     ) {
         let mut blocks = Vec::with_capacity(self.fragmented_blocks_size.load(Ordering::SeqCst));
         while let Some(mut x) = self.fragmented_blocks.pop() {
@@ -188,7 +238,7 @@ impl MatureEvacuationSet {
         }
         blocks.sort_by_key(|x| x.1);
         while let Some((block, _dead_bytes)) = blocks.pop() {
-            if Self::skip_block(block) || copy_targets.binary_search(&block.start()).is_ok() {
+            if Self::skip_block(block) || kept_blocks.binary_search(&block.start()).is_ok() {
                 continue;
             }
             block.set_as_defrag_source(true);
@@ -220,9 +270,13 @@ impl MatureEvacuationSet {
         let max_copy_bytes = available_clean_pages_for_defrag << LOG_BYTES_IN_PAGE;
         let mut copy_bytes = 0usize;
         let mut selected_blocks = vec![];
-        // Blocks this pause copied objects into are left out: emptying them again in the same pause would copy their objects twice.
-        let copy_targets = lxr.block_allocation.copy_target_blocks();
-        self.select_fragmented_blocks(&mut selected_blocks, &mut copy_bytes, max_copy_bytes, &copy_targets);
+        // Blocks this pause copied objects into are left out, since emptying them again in the same pause would copy their objects twice, and so are blocks holding objects that must not move.
+        let mut kept_blocks = lxr.block_allocation.copy_target_blocks();
+        while let Some(block) = self.pinned_blocks.pop() {
+            kept_blocks.push(block.start());
+        }
+        kept_blocks.sort_unstable();
+        self.select_fragmented_blocks(&mut selected_blocks, &mut copy_bytes, max_copy_bytes, &kept_blocks);
         self.num_defrag_blocks
             .store(selected_blocks.len(), Ordering::SeqCst);
         let mut defrag_blocks = self.defrag_blocks.lock().unwrap();

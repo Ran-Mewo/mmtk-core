@@ -229,6 +229,11 @@ impl Block {
         Self::DEFRAG_STATE_TABLE.store_atomic::<u8>(self.start(), byte, Ordering::SeqCst);
     }
 
+    /// Takes the block out of the defragmentation set, returning whether it was in it.
+    pub fn attempt_unset_defrag_source(&self) -> bool {
+        Self::DEFRAG_STATE_TABLE.compare_exchange_atomic::<u8>(self.start(), Self::DEFRAG_SOURCE_STATE, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
     /// Record the number of holes in the block.
     pub fn set_holes(&self, holes: usize) {
         Self::DEFRAG_STATE_TABLE.store_atomic::<u8>(self.start(), holes as u8, Ordering::SeqCst);

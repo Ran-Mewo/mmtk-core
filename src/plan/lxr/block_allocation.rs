@@ -109,9 +109,7 @@ impl<VM: VMBinding> BlockAllocation<VM> {
     pub fn copy_target_blocks(&self) -> Vec<Address> {
         let targets = std::cell::RefCell::new(Vec::new());
         self.copy_blocks.visit_slice(|blocks| targets.borrow_mut().extend(blocks.iter().map(|b| b.load(Ordering::Relaxed).start())));
-        let mut targets = targets.into_inner();
-        targets.sort_unstable();
-        targets
+        targets.into_inner()
     }
 
     pub fn reset_copy_target_blocks(&self) {
